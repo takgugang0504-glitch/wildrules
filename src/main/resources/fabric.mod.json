@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "wildrules",
+  "version": "${version}",
+  "name": "Wild Rules",
+  "description": "야생 규칙: PvP 보호, 신호기 시스템 (서버에만 설치하면 됨)",
+  "authors": ["wild"],
+  "environment": "*",
+  "entrypoints": { "main": ["kr.wildrules.WildRulesMod"] },
+  "depends": { "fabricloader": ">=0.19.0", "minecraft": "~26.3", "java": ">=25", "fabric-api": "*" }
+}

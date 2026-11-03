@@ -1,0 +1,7 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "pattern": ["GGG", "GDG", "OOO"],
+  "key": { "G": "minecraft:glass", "D": "minecraft:diamond_block", "O": "minecraft:obsidian" },
+  "result": { "id": "minecraft:beacon", "count": 1 }
+}
