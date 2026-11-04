@@ -1,0 +1,12 @@
+{
+  "required": false,
+  "package": "kr.wildrules.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EnchantmentMixin",
+    "EndCrystalMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

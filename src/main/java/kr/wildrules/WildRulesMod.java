@@ -1,16 +1,30 @@
 package kr.wildrules;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.mojang.serialization.JsonOps;
 import com.google.gson.GsonBuilder;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerBlockEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.resources.RegistryOps;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.enchantment.Enchantment;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
@@ -23,6 +37,11 @@ import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectInstance;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
+import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
@@ -31,6 +50,8 @@ import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.scores.Objective;
 import net.minecraft.world.scores.ReadOnlyScoreInfo;
 import net.minecraft.world.scores.Scoreboard;
@@ -48,17 +69,17 @@ public class WildRulesMod implements ModInitializer {
     static final double DETECT_RANGE = 150.0;     // 감지 범위(칸)
     static final int MIN_STREAK = 2;              // 이 연속킬 이상이면 감지 대상
     static final double BUFF_RANGE = 50.0;        // 주인 버프 범위(칸)
-    static final long BUFF_MILLIS = 10L * 60L * 1000L; // 광물 1개당 버프 지속(현실 시간 10분)
     static final String STREAK_OBJECTIVE = "wr_streak"; // 데이터팩의 연속킬 점수판
 
     // ---- 저장 데이터 ----
     static class Rec {
         String dim; int x, y, z; String owner; String ownerName;
-        Map<String, Long> until = new HashMap<>();
+        String effect;
     }
     static class Data {
         Map<String, Integer> placed = new HashMap<>();
         List<Rec> beacons = new ArrayList<>();
+        Map<String, Long> bans = new HashMap<>();
     }
     static class Pending { String dim; BlockPos pos; UUID uuid; String name; int age; }
 
@@ -68,6 +89,25 @@ public class WildRulesMod implements ModInitializer {
     static MinecraftServer server;
     static final List<Pending> pending = new ArrayList<>();
     static final Map<String, Set<UUID>> flagged = new HashMap<>();
+    static final Map<UUID, Double> macePending = new HashMap<>();
+    static final Map<UUID, Integer> crystalHits = new HashMap<>();
+    static final Map<UUID, Long> crystalLast = new HashMap<>();
+    static final Map<UUID, Integer> shieldPending = new HashMap<>();
+    static final Map<UUID, Long> lastNotice = new HashMap<>();
+    static final Set<UUID> banNotified = new HashSet<>();
+    record Rm(String dim, BlockPos pos) { }
+    static final List<Rm> removeQueue = new ArrayList<>();
+    static final Map<String, Integer> AXE_SECONDS = Map.of("minecraft:wooden_axe", 1, "minecraft:golden_axe", 1,
+        "minecraft:stone_axe", 3, "minecraft:iron_axe", 4, "minecraft:diamond_axe", 6, "minecraft:netherite_axe", 10);
+    /** 인챈트 최대 레벨 (EnchantmentMixin 이 사용) */
+    public static final Map<String, Integer> MAX_LEVELS = new HashMap<>();
+    static {
+        String[][] a = {{"sharpness","15"},{"smite","10"},{"protection","10"},{"fire_protection","10"},
+            {"blast_protection","10"},{"projectile_protection","10"},{"unbreaking","5"},{"fire_aspect","5"},
+            {"knockback","10"},{"thorns","5"},{"depth_strider","5"},{"feather_falling","8"},{"fortune","5"},
+            {"efficiency","10"},{"looting","5"},{"power","10"},{"punch","4"},{"sweeping_edge","5"}};
+        for (String[] e : a) MAX_LEVELS.put("enchantment.minecraft." + e[0], Integer.parseInt(e[1]));
+    }
 
     @Override
     public void onInitialize() {
@@ -77,6 +117,12 @@ public class WildRulesMod implements ModInitializer {
         UseBlockCallback.EVENT.register(WildRulesMod::onUse);
         ServerTickEvents.END_SERVER_TICK.register(WildRulesMod::onTick);
         ServerLivingEntityEvents.ALLOW_DAMAGE.register(WildRulesMod::allowDamage);
+        ServerLivingEntityEvents.AFTER_DEATH.register(WildRulesMod::afterDeath);
+        PlayerBlockBreakEvents.BEFORE.register(WildRulesMod::beforeBreak);
+        AttackEntityCallback.EVENT.register(WildRulesMod::onAttack);
+        ServerBlockEntityEvents.BLOCK_ENTITY_LOAD.register((be, world) -> {
+            if (be.getBlockState().is(Blocks.ENDER_CHEST)) removeQueue.add(new Rm(dimKey(world), be.getBlockPos().immutable()));
+        });
     }
 
     // ---------- 저장/불러오기 ----------
@@ -85,6 +131,7 @@ public class WildRulesMod implements ModInitializer {
             if (Files.exists(file)) {
                 Data d = GSON.fromJson(Files.readString(file), Data.class);
                 if (d != null) data = d;
+                if (data.bans == null) data.bans = new HashMap<>();
             }
         } catch (Exception e) { System.err.println("[wildrules] load failed: " + e); }
     }
@@ -98,6 +145,12 @@ public class WildRulesMod implements ModInitializer {
     static ServerLevel levelOf(MinecraftServer s, String dim) {
         for (ServerLevel l : s.getAllLevels()) if (dimKey(l).equals(dim)) return l;
         return null;
+    }
+    static int countOwned(String owner) {
+        int n = 0;
+        for (Rec q : data.beacons) if (q.owner.equals(owner)) n++;
+        for (Pending q : pending) if (q.uuid.toString().equals(owner)) n++;
+        return n;
     }
     static Rec find(String dim, BlockPos p) {
         for (Rec r : data.beacons) if (r.dim.equals(dim) && r.x == p.getX() && r.y == p.getY() && r.z == p.getZ()) return r;
@@ -144,6 +197,12 @@ public class WildRulesMod implements ModInitializer {
         BlockPos pos = hit.getBlockPos();
         ItemStack held = player.getItemInHand(hand);
 
+        if (level.getBlockState(pos).is(Blocks.ENDER_CHEST)) {
+            removeQueue.add(new Rm(dimKey(level), pos.immutable()));
+            say(sp, "엔더 상자는 이 서버에서 사용할 수 없습니다.", ChatFormatting.RED);
+            return InteractionResult.FAIL;
+        }
+        if (held.is(Items.ENDER_CHEST)) { held.shrink(1); return InteractionResult.FAIL; }
         // 1) 신호기 우클릭: 바닐라 GUI(효과 선택)를 막고 광물 투입/상태 표시
         if (level.getBlockState(pos).is(Blocks.BEACON) && !player.isShiftKeyDown()) {
             useBeacon(sp, level, pos, held);
@@ -154,7 +213,7 @@ public class WildRulesMod implements ModInitializer {
             BlockPlaceContext ctx = new BlockPlaceContext(player, hand, held, hit);
             if (!ctx.canPlace()) return InteractionResult.PASS;
             String id = sp.getUUID().toString();
-            if (data.placed.getOrDefault(id, 0) >= MAX_BEACONS) {
+            if (countOwned(id) >= MAX_BEACONS) {
                 held.shrink(1);
                 say(sp, "신호기는 한 사람당 " + MAX_BEACONS + "번만 설치할 수 있습니다. 신호기가 사라졌습니다.", ChatFormatting.RED);
                 return InteractionResult.FAIL;
@@ -175,23 +234,25 @@ public class WildRulesMod implements ModInitializer {
             return;
         }
         String key = ingotKey(held);
-        long now = System.currentTimeMillis();
         if (key != null) {
+            if (key.equals(r.effect)) { say(sp, "이미 적용 중인 버프입니다: " + ingotLabel(key), ChatFormatting.GRAY); return; }
             if (!sp.getAbilities().instabuild) held.shrink(1);
-            long base = Math.max(now, r.until.getOrDefault(key, 0L));
-            r.until.put(key, base + BUFF_MILLIS);
+            r.effect = key;
             save();
-            say(sp, "신호기 버프 충전: " + ingotLabel(key) + " (+10분)", ChatFormatting.GREEN);
+            say(sp, "신호기 버프 설정: " + ingotLabel(key), ChatFormatting.GREEN);
             return;
         }
-        StringBuilder sb = new StringBuilder("신호기 버프 남은 시간: ");
-        boolean any = false;
-        for (String k : List.of("iron", "gold", "emerald", "diamond", "netherite")) {
-            long left = r.until.getOrDefault(k, 0L) - now;
-            if (left > 0) { sb.append(ingotLabel(k)).append(" ").append(left / 60000L).append("분  "); any = true; }
-        }
-        if (!any) sb.append("없음 (철/금/에메랄드/다이아/네더라이트를 우클릭으로 넣으세요)");
-        say(sp, sb.toString(), ChatFormatting.AQUA);
+        say(sp, r.effect == null ? "신호기 버프: 없음 (철/금/에메랄드/다이아/네더라이트를 우클릭으로 넣으세요)"
+                                 : "신호기 버프: " + ingotLabel(r.effect), ChatFormatting.AQUA);
+    }
+
+    // 주인이 아니면 신호기를 부술 수 없음
+    static boolean beforeBreak(Level level, Player player, BlockPos pos, net.minecraft.world.level.block.state.BlockState state, net.minecraft.world.level.block.entity.BlockEntity be) {
+        if (level.isClientSide() || !state.is(Blocks.BEACON)) return true;
+        Rec r = find(dimKey(level), pos);
+        if (r == null || r.owner.equals(player.getUUID().toString())) return true;
+        if (player instanceof ServerPlayer sp) say(sp, "다른 사람의 신호기는 부술 수 없습니다.", ChatFormatting.RED);
+        return false;
     }
 
     // ---------- 틱 처리 ----------
@@ -207,7 +268,8 @@ public class WildRulesMod implements ModInitializer {
                 r.dim = p.dim; r.x = p.pos.getX(); r.y = p.pos.getY(); r.z = p.pos.getZ();
                 r.owner = p.uuid.toString(); r.ownerName = p.name;
                 data.beacons.add(r);
-                int n = data.placed.merge(p.uuid.toString(), 1, Integer::sum);
+                int n = 0;
+                for (Rec q : data.beacons) if (q.owner.equals(p.uuid.toString())) n++;
                 save();
                 ServerPlayer pl = s.getPlayerList().getPlayer(p.uuid);
                 if (pl != null) say(pl, "신호기 설치 (" + n + "/" + MAX_BEACONS + ")", ChatFormatting.YELLOW);
@@ -215,8 +277,64 @@ public class WildRulesMod implements ModInitializer {
             }
             if (done || ++p.age > 3) it.remove();
         }
+        // 철퇴: 공격 후 낙하거리 복원
+        if (!macePending.isEmpty()) {
+            for (Map.Entry<UUID, Double> e : new ArrayList<>(macePending.entrySet())) {
+                ServerPlayer mp = s.getPlayerList().getPlayer(e.getKey());
+                if (mp != null) mp.fallDistance = (float) (double) e.getValue();
+            }
+            macePending.clear();
+        }
+        // 신호기 바닐라 활성화(빛줄기/효과) 차단: 피라미드 레벨을 매 틱 0으로
+        for (Rec r : data.beacons) {
+            ServerLevel bl = levelOf(s, r.dim);
+            if (bl != null && bl.hasChunkAt(new BlockPos(r.x, r.y, r.z)))
+                cmd(bl, "data modify block " + r.x + " " + r.y + " " + r.z + " Levels set value 0");
+        }
+        if (!shieldPending.isEmpty()) {   // 도끼 방패 무력화 시간: 바닐라가 건 쿨다운을 도끼 등급별 시간으로 교체
+            for (Map.Entry<UUID, Integer> e : new ArrayList<>(shieldPending.entrySet())) {
+                ServerPlayer tp = s.getPlayerList().getPlayer(e.getKey());
+                if (tp != null) for (ItemStack st : List.of(tp.getOffhandItem(), tp.getMainHandItem()))
+                    if (st.is(Items.SHIELD) && tp.getCooldowns().isOnCooldown(st)) tp.getCooldowns().addCooldown(st, e.getValue());
+            }
+            shieldPending.clear();
+        }
+        for (Iterator<Rm> ri = removeQueue.iterator(); ri.hasNext(); ) {   // 엔더 상자 제거
+            Rm rm = ri.next();
+            ServerLevel rl = levelOf(s, rm.dim());
+            if (rl == null || !rl.hasChunkAt(rm.pos())) continue;
+            if (rl.getBlockState(rm.pos()).is(Blocks.ENDER_CHEST))
+                cmd(rl, "setblock " + rm.pos().getX() + " " + rm.pos().getY() + " " + rm.pos().getZ() + " air");
+            ri.remove();
+        }
+        if (s.getTickCount() % 2 == 0) {
+            tickHeads(s);
+            for (ServerPlayer cp : s.getPlayerList().getPlayers()) {
+                try { for (var slot : cp.containerMenu.slots) clampMace(slot.getItem()); }
+                catch (Exception ex) { if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] mace clamp failed: " + ex); } }
+            }
+        }
         if (s.getTickCount() % 10 != 0) return;
-        long now = System.currentTimeMillis();
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            String nm = p.getName().getString();
+            if (score(s, p, "wr_banclear") > 0) {
+                data.bans.remove(p.getUUID().toString()); banNotified.remove(p.getUUID()); save();
+                cmd(s.overworld(), "scoreboard players set " + nm + " wr_banclear 0");
+            }
+            if (score(s, p, "wr_banreq") > 0) {
+                data.bans.put(p.getUUID().toString(), System.currentTimeMillis() + 24L * 3600L * 1000L); save();
+                cmd(s.overworld(), "scoreboard players set " + nm + " wr_banreq 0");
+            }
+            long left = banLeft(p.getUUID());
+            if (left > 0 && banNotified.add(p.getUUID()))
+                say(p, "[패널티] 보상 악용으로 PvP 금지 중입니다. 남은 시간: " + fmt(left) + " (현실 시간 기준, /trigger pvpban 으로 확인)", ChatFormatting.RED);
+            if (left <= 0) banNotified.remove(p.getUUID());
+            if (score(s, p, "pvpban") > 0) {
+                say(p, left > 0 ? "[패널티] PvP 금지 남은 시간: " + fmt(left) : "[패널티] PvP 금지 상태가 아닙니다.", ChatFormatting.YELLOW);
+                cmd(s.overworld(), "scoreboard players set " + nm + " pvpban 0");
+            }
+            patchInventory(s, p);
+        }
 
         for (Rec r : new ArrayList<>(data.beacons)) {
             ServerLevel lvl = levelOf(s, r.dim);
@@ -233,14 +351,11 @@ public class WildRulesMod implements ModInitializer {
             String key = r.dim + r.x + "," + r.y + "," + r.z;
             if (owner == null) { flagged.remove(key); continue; }
 
-            // (1) 주인 버프: 주인이 근처에 있을 때만
-            if (dimKey(owner.level()).equals(r.dim) && owner.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) <= BUFF_RANGE * BUFF_RANGE) {
-                for (Map.Entry<String, Long> e : r.until.entrySet()) {
-                    if (e.getValue() > now) {
-                        Holder<MobEffect> eff = effectOf(e.getKey());
-                        if (eff != null) owner.addEffect(new MobEffectInstance(eff, 60, 0, true, false, true));
-                    }
-                }
+            // (1) 주인 버프: 주인이 근처에 있으면 선택한 광물의 버프가 계속 유지
+            if (r.effect != null && dimKey(owner.level()).equals(r.dim)
+                    && owner.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) <= BUFF_RANGE * BUFF_RANGE) {
+                Holder<MobEffect> eff = effectOf(r.effect);
+                if (eff != null) owner.addEffect(new MobEffectInstance(eff, 60, 0, true, false, true));
             }
 
             // (2) 연속킬 MIN_STREAK 이상 플레이어 감지 (주인에게만 알림/표시)
@@ -272,14 +387,182 @@ public class WildRulesMod implements ModInitializer {
         ReadOnlyScoreInfo info = sb.getPlayerScoreInfo(p, obj);
         return info == null ? 0 : info.value();
     }
+    static void notice(ServerPlayer p, String text, ChatFormatting c) {
+        long now = System.currentTimeMillis();
+        Long l = lastNotice.get(p.getUUID());
+        if (l != null && now - l < 1000) return;
+        lastNotice.put(p.getUUID(), now);
+        p.sendSystemMessage(Component.literal(text).withStyle(c), true);
+    }
+    static long banLeft(UUID id) {
+        Long e = data.bans.get(id.toString());
+        if (e == null) return 0;
+        long left = e - System.currentTimeMillis();
+        if (left <= 0) { data.bans.remove(id.toString()); save(); return 0; }
+        return left;
+    }
+    static String fmt(long ms) { long m = ms / 60000L; return (m / 60) + "시간 " + (m % 60) + "분"; }
     static boolean allowDamage(LivingEntity victim, DamageSource source, float amount) {
         if (server == null || !(victim instanceof ServerPlayer v)) return true;
         Entity a = source.getEntity();                 // 투사체면 쏜 사람
         if (!(a instanceof ServerPlayer att) || att == v) return true;   // 몹/환경 피해는 그대로
-        if (score(server, v, "wr_prot") > 0) return false;    // 맞는 사람이 무적
-        if (score(server, att, "wr_prot") > 0) return false;  // 때리는 사람이 무적
-        int banEnd = score(server, att, "wr_banend");          // 패널티 PvP 금지
-        if (banEnd > 0 && banEnd > server.overworld().getGameTime()) return false;
+        if (score(server, v, "wr_prot") > 0) { notice(att, "상대는 무적 시간입니다", ChatFormatting.AQUA); return false; }
+        if (score(server, att, "wr_prot") > 0) { notice(att, "무적 시간 중에는 다른 플레이어를 공격할 수 없습니다", ChatFormatting.AQUA); return false; }
+        long left = banLeft(att.getUUID());
+        if (left > 0) { notice(att, "PvP 금지 중 - 남은 시간 " + fmt(left), ChatFormatting.RED); return false; }
         return true;
+    }
+
+    // ---------- 명령 실행 도우미 ----------
+    static void cmd(ServerLevel l, String c) {
+        try {
+            server.getCommands().performPrefixedCommand(
+                server.createCommandSourceStack().withLevel(l).withSuppressedOutput(), c);
+        } catch (Exception ignored) { }
+    }
+
+    // ---------- 철퇴: 공격 쿨타임이 다 차지 않으면 낙하 추가 피해/효과 없음 ----------
+    static InteractionResult onAttack(Player player, Level level, InteractionHand hand, Entity target, EntityHitResult hit) {
+        if (level.isClientSide() || !(player instanceof ServerPlayer sp)) return InteractionResult.PASS;
+        if (sp.getMainHandItem().is(Items.MACE) && sp.getAttackStrengthScale(0.5F) < 0.9F && sp.fallDistance > 1.5) {
+            macePending.put(sp.getUUID(), (double) sp.fallDistance);
+            sp.fallDistance = 0;
+        }
+        if (target instanceof ServerPlayer tp && tp.isBlocking()) {
+            String hid = itemId(sp.getMainHandItem());
+            if (hid.endsWith("_spear")) tp.stopUsingItem();                  // 창: 방패 무시
+            else if (AXE_SECONDS.containsKey(hid)) shieldPending.put(tp.getUUID(), AXE_SECONDS.get(hid) * 20);
+        }
+        return InteractionResult.PASS;
+    }
+    static String itemId(ItemStack st) {
+        var k = BuiltInRegistries.ITEM.getKey(st.getItem());
+        return k == null ? "" : k.toString();
+    }
+
+    // ---------- 머리 착용: 해당 몹은 플레이어를 쫓지 않음 ----------
+    static String typeId(Entity e) {
+        var k = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType());
+        return k == null ? "" : k.toString();
+    }
+    static final Set<String> ZOMBIES = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombie_villager");
+    static final Set<String> SKELETONS = Set.of("minecraft:skeleton", "minecraft:stray", "minecraft:bogged");
+    static final Set<String> UNDEAD = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombie_villager",
+        "minecraft:zombified_piglin", "minecraft:skeleton", "minecraft:stray", "minecraft:bogged", "minecraft:wither_skeleton",
+        "minecraft:wither", "minecraft:zoglin", "minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:phantom");
+    static boolean ignores(ItemStack head, Mob m) {
+        String id = typeId(m);
+        if (head.is(Items.ZOMBIE_HEAD)) return ZOMBIES.contains(id);
+        if (head.is(Items.SKELETON_SKULL)) return SKELETONS.contains(id);
+        if (head.is(Items.CREEPER_HEAD)) return id.equals("minecraft:creeper");
+        if (head.is(Items.WITHER_SKELETON_SKULL)) return id.equals("minecraft:wither_skeleton");
+        if (head.is(Items.PIGLIN_HEAD)) return UNDEAD.contains(id);
+        return false;
+    }
+    static void tickHeads(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            ItemStack head = p.getItemBySlot(EquipmentSlot.HEAD);
+            if (head.isEmpty()) continue;
+            for (Mob m : p.level().getEntitiesOfClass(Mob.class, p.getBoundingBox().inflate(32.0))) {
+                if (m.getTarget() == p && ignores(head, m)) m.setTarget(null);
+            }
+        }
+    }
+
+    // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
+    static void afterDeath(LivingEntity e, DamageSource src) {
+        if (server == null || !(src.getEntity() instanceof ServerPlayer)) return;
+        if (!(e.level() instanceof ServerLevel lvl)) return;
+        String id = typeId(e);
+        String item = null; double chance = 0;
+        if (ZOMBIES.contains(id)) { item = "zombie_head"; chance = 0.005; }
+        else if (SKELETONS.contains(id)) { item = "skeleton_skull"; chance = 0.005; }
+        else if (id.equals("minecraft:creeper")) { item = "creeper_head"; chance = 0.005; }
+        else if (id.equals("minecraft:piglin") || id.equals("minecraft:piglin_brute")) { item = "piglin_head"; chance = 0.001; }
+        if (item == null || lvl.getRandom().nextDouble() >= chance) return;
+        cmd(lvl, "summon minecraft:item " + e.getX() + " " + (e.getY() + 0.3) + " " + e.getZ()
+                + " {Item:{id:\"minecraft:" + item + "\",count:1}}");
+    }
+
+    // ---------- 엔드 크리스탈: 3번 맞아야 부서지고, 맞을 때마다 주변 엔티티를 밀쳐냄 ----------
+    /** @return true 면 바닐라대로 부서짐, false 면 이번 타격은 무효 */
+    public static boolean crystalHit(ServerLevel level, EndCrystal crystal, DamageSource source) {
+        // 플레이어(또는 플레이어가 쏜 투사체/설치한 TNT)가 때린 경우만 센다. 불/드래곤/기타는 바닐라 처리.
+        if (!(source.getEntity() instanceof ServerPlayer)) return true;
+        UUID id = crystal.getUUID();
+        long gt = level.getGameTime();
+        Long last = crystalLast.get(id);
+        if (last != null && gt - last < 10) return false;      // 같은 타격의 중복 호출은 무시(파티클/밀치기 1번만)
+        crystalLast.put(id, gt);
+        int hits = crystalHits.merge(id, 1, Integer::sum);
+        if (hits >= 3) { crystalHits.remove(id); crystalLast.remove(id); return true; }
+        Vec3 c = crystal.position();
+        cmd(level, "particle minecraft:poof " + c.x + " " + (c.y + 0.5) + " " + c.z + " 0.4 0.4 0.4 0.02 8 force");
+        for (Entity en : level.getEntitiesOfClass(Entity.class, crystal.getBoundingBox().inflate(10.0))) {
+            if (en == crystal || en instanceof EndCrystal || en instanceof EnderDragon || en.getClass().getSimpleName().contains("EnderDragon")) continue;
+            Vec3 d = en.position().subtract(c);
+            double h = Math.sqrt(d.x * d.x + d.z * d.z);
+            double nx = h < 0.01 ? 1.0 : d.x / h, nz = h < 0.01 ? 0.0 : d.z / h;
+            en.push(nx * 2.5, 0.9, nz * 2.5);
+            if (en instanceof ServerPlayer sp) sp.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket(sp));
+        }
+        return false;
+    }
+
+    // ---------- 방패 피해 감소 80% / 철퇴 날카로움 최대 5 ----------
+    static <T> void patch(MinecraftServer s, ItemStack st, DataComponentType<T> type, java.util.function.Predicate<JsonElement> edit) {
+        T cur = st.get(type);
+        if (cur == null) return;
+        var ops = RegistryOps.create(JsonOps.INSTANCE, s.registryAccess());
+        var codec = type.codecOrThrow();
+        JsonElement j = codec.encodeStart(ops, cur).getOrThrow();
+        if (!edit.test(j)) return;
+        T neu = codec.parse(ops, j).getOrThrow();
+        st.set(type, neu);
+    }
+    static void patchInventory(MinecraftServer s, ServerPlayer p) {
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack st = inv.getItem(i);
+            if (st.isEmpty()) continue;
+            try {
+                if (st.is(Items.SHIELD)) patch(s, st, DataComponents.BLOCKS_ATTACKS, WildRulesMod::shieldEdit);
+                clampMace(st);
+            } catch (Exception ex) {
+                if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] item patch failed: " + ex); }
+            }
+        }
+    }
+    static boolean patchWarned = false;
+    static void clampMace(ItemStack st) {
+        if (st.isEmpty() || !st.is(Items.MACE)) return;
+        ItemEnchantments en = st.get(DataComponents.ENCHANTMENTS);
+        if (en == null) return;
+        for (Holder<Enchantment> h : en.keySet()) {
+            if (h.is(Enchantments.SHARPNESS) && en.getLevel(h) > 5) {
+                EnchantmentHelper.updateEnchantments(st, m -> m.set(h, 5));
+                return;
+            }
+        }
+    }
+    static boolean shieldEdit(JsonElement j) {
+        if (!j.isJsonObject()) return false;
+        JsonElement arr = j.getAsJsonObject().get("damage_reductions");
+        if (arr == null || !arr.isJsonArray()) return false;
+        boolean ch = false;
+        for (JsonElement e : arr.getAsJsonArray()) {
+            if (!e.isJsonObject()) continue;
+            JsonObject o = e.getAsJsonObject();
+            if (!o.has("factor") || Math.abs(o.get("factor").getAsDouble() - 0.8) > 0.001) { o.addProperty("factor", 0.8); ch = true; }
+        }
+        return ch;
+    }
+    static boolean maceEdit(JsonElement j) {
+        if (!j.isJsonObject()) return false;
+        JsonObject o = j.getAsJsonObject();
+        if (o.has("levels") && o.get("levels").isJsonObject()) o = o.getAsJsonObject("levels");
+        JsonElement sh = o.get("minecraft:sharpness");
+        if (sh != null && sh.getAsInt() > 5) { o.addProperty("minecraft:sharpness", 5); return true; }
+        return false;
     }
 }
