@@ -11,6 +11,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerBlockEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.loader.api.FabricLoader;
@@ -96,9 +97,19 @@ public class WildRulesMod implements ModInitializer {
     static final Map<UUID, Long> lastNotice = new HashMap<>();
     static final Set<UUID> banNotified = new HashSet<>();
     record Rm(String dim, BlockPos pos) { }
+    // ---- 전투(PvP) 모드 ----
+    static class Combat {
+        UUID a, b; boolean active; int hitsA, hitsB;
+        String dim; double x, y, z; long endMs, lastMs; long outA = -1, outB = -1;
+    }
+    static final List<Combat> combats = new ArrayList<>();
+    static final long COMBAT_MS = 10L * 60L * 1000L;   // 전투 모드 지속(마지막 타격 후 10분)
+    static final int HITS_TO_START = 5;                // 이 횟수 이상 때리면 전투 모드
+    static final double ZONE_R = 50.0, ZONE_H = 10.0;  // 구역 반경/높이
+    static final int OUT_TICKS = 60;                   // 구역 밖 3초
     static final List<Rm> removeQueue = new ArrayList<>();
-    static final Map<String, Integer> AXE_SECONDS = Map.of("minecraft:wooden_axe", 1, "minecraft:golden_axe", 1,
-        "minecraft:stone_axe", 3, "minecraft:iron_axe", 4, "minecraft:diamond_axe", 6, "minecraft:netherite_axe", 10);
+    static final Map<String, Integer> AXE_SECONDS = Map.of("minecraft:wooden_axe", 2, "minecraft:golden_axe", 2,
+        "minecraft:stone_axe", 4, "minecraft:iron_axe", 8, "minecraft:diamond_axe", 12, "minecraft:netherite_axe", 20);
     /** 인챈트 최대 레벨 (EnchantmentMixin 이 사용) */
     public static final Map<String, Integer> MAX_LEVELS = new HashMap<>();
     static {
@@ -120,6 +131,10 @@ public class WildRulesMod implements ModInitializer {
         ServerLivingEntityEvents.AFTER_DEATH.register(WildRulesMod::afterDeath);
         PlayerBlockBreakEvents.BEFORE.register(WildRulesMod::beforeBreak);
         AttackEntityCallback.EVENT.register(WildRulesMod::onAttack);
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, srv) -> {
+            if (!srv.isRunning()) return;
+            try { onDisconnect(handler.getPlayer()); } catch (Exception ex) { System.err.println("[wildrules] disconnect: " + ex); }
+        });
         ServerBlockEntityEvents.BLOCK_ENTITY_LOAD.register((be, world) -> {
             if (be.getBlockState().is(Blocks.ENDER_CHEST)) removeQueue.add(new Rm(dimKey(world), be.getBlockPos().immutable()));
         });
@@ -307,6 +322,7 @@ public class WildRulesMod implements ModInitializer {
                 cmd(rl, "setblock " + rm.pos().getX() + " " + rm.pos().getY() + " " + rm.pos().getZ() + " air");
             ri.remove();
         }
+        if (s.getTickCount() % 5 == 0) tickCombat(s);
         if (s.getTickCount() % 2 == 0) {
             tickHeads(s);
             for (ServerPlayer cp : s.getPlayerList().getPlayers()) {
@@ -322,7 +338,7 @@ public class WildRulesMod implements ModInitializer {
                 cmd(s.overworld(), "scoreboard players set " + nm + " wr_banclear 0");
             }
             if (score(s, p, "wr_banreq") > 0) {
-                data.bans.put(p.getUUID().toString(), System.currentTimeMillis() + 24L * 3600L * 1000L); save();
+                data.bans.put(p.getUUID().toString(), System.currentTimeMillis() + 48L * 3600L * 1000L); save();
                 cmd(s.overworld(), "scoreboard players set " + nm + " wr_banreq 0");
             }
             long left = banLeft(p.getUUID());
@@ -403,6 +419,8 @@ public class WildRulesMod implements ModInitializer {
     }
     static String fmt(long ms) { long m = ms / 60000L; return (m / 60) + "시간 " + (m % 60) + "분"; }
     static boolean allowDamage(LivingEntity victim, DamageSource source, float amount) {
+        if (server != null && victim.isBlocking() && source.getEntity() instanceof LivingEntity spearer
+                && itemId(spearer.getMainHandItem()).endsWith("_spear")) victim.stopUsingItem();   // 창: 방패 무시
         if (server == null || !(victim instanceof ServerPlayer v)) return true;
         Entity a = source.getEntity();                 // 투사체면 쏜 사람
         if (!(a instanceof ServerPlayer att) || att == v) return true;   // 몹/환경 피해는 그대로
@@ -410,6 +428,7 @@ public class WildRulesMod implements ModInitializer {
         if (score(server, att, "wr_prot") > 0) { notice(att, "무적 시간 중에는 다른 플레이어를 공격할 수 없습니다", ChatFormatting.AQUA); return false; }
         long left = banLeft(att.getUUID());
         if (left > 0) { notice(att, "PvP 금지 중 - 남은 시간 " + fmt(left), ChatFormatting.RED); return false; }
+        combatHit(att, v);
         return true;
     }
 
@@ -430,8 +449,7 @@ public class WildRulesMod implements ModInitializer {
         }
         if (target instanceof ServerPlayer tp && tp.isBlocking()) {
             String hid = itemId(sp.getMainHandItem());
-            if (hid.endsWith("_spear")) tp.stopUsingItem();                  // 창: 방패 무시
-            else if (AXE_SECONDS.containsKey(hid)) shieldPending.put(tp.getUUID(), AXE_SECONDS.get(hid) * 20);
+            if (AXE_SECONDS.containsKey(hid)) shieldPending.put(tp.getUUID(), AXE_SECONDS.get(hid) * 20);
         }
         return InteractionResult.PASS;
     }
@@ -471,6 +489,7 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
+        if (e instanceof ServerPlayer dp) combats.removeIf(c -> c.a.equals(dp.getUUID()) || c.b.equals(dp.getUUID()));
         if (server == null || !(src.getEntity() instanceof ServerPlayer)) return;
         if (!(e.level() instanceof ServerLevel lvl)) return;
         String id = typeId(e);
@@ -529,7 +548,7 @@ public class WildRulesMod implements ModInitializer {
                 if (st.is(Items.SHIELD)) patch(s, st, DataComponents.BLOCKS_ATTACKS, WildRulesMod::shieldEdit);
                 clampMace(st);
             } catch (Exception ex) {
-                if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] item patch failed: " + ex); }
+                if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] item patch failed: " + ex); say(p, "[wildrules] 방패 패치 실패: " + ex, ChatFormatting.RED); }
             }
         }
     }
@@ -547,8 +566,18 @@ public class WildRulesMod implements ModInitializer {
     }
     static boolean shieldEdit(JsonElement j) {
         if (!j.isJsonObject()) return false;
-        JsonElement arr = j.getAsJsonObject().get("damage_reductions");
-        if (arr == null || !arr.isJsonArray()) return false;
+        JsonObject root = j.getAsJsonObject();
+        JsonElement arr = root.get("damage_reductions");
+        if (arr == null || !arr.isJsonArray()) {          // 기본값(방패 100%)은 인코딩 시 생략됨 -> 80% 짜리를 직접 넣음
+            com.google.gson.JsonArray na = new com.google.gson.JsonArray();
+            JsonObject d = new JsonObject();
+            d.addProperty("horizontal_blocking_angle", 90.0);
+            d.addProperty("base", 0.0);
+            d.addProperty("factor", 0.8);
+            na.add(d);
+            root.add("damage_reductions", na);
+            return true;
+        }
         boolean ch = false;
         for (JsonElement e : arr.getAsJsonArray()) {
             if (!e.isJsonObject()) continue;
@@ -564,5 +593,96 @@ public class WildRulesMod implements ModInitializer {
         JsonElement sh = o.get("minecraft:sharpness");
         if (sh != null && sh.getAsInt() > 5) { o.addProperty("minecraft:sharpness", 5); return true; }
         return false;
+    }
+
+    // ---------- 전투(PvP) 모드 ----------
+    static void setCenter(Combat c, ServerPlayer v) { c.dim = dimKey(v.level()); c.x = v.getX(); c.y = v.getY(); c.z = v.getZ(); }
+
+    static void combatHit(ServerPlayer att, ServerPlayer v) {
+        long now = System.currentTimeMillis();
+        Combat c = null;
+        for (Combat q : combats)
+            if ((q.a.equals(att.getUUID()) && q.b.equals(v.getUUID())) || (q.a.equals(v.getUUID()) && q.b.equals(att.getUUID()))) { c = q; break; }
+        if (c == null) { c = new Combat(); c.a = att.getUUID(); c.b = v.getUUID(); combats.add(c); }
+        if (!c.active && now - c.lastMs > COMBAT_MS) { c.hitsA = 0; c.hitsB = 0; }
+        c.lastMs = now;
+        if (c.active) { setCenter(c, v); c.endMs = now + COMBAT_MS; return; }   // 서로 때릴 때마다 구역 이동 + 10분 리셋
+        boolean fromA = c.a.equals(att.getUUID());
+        int n = fromA ? ++c.hitsA : ++c.hitsB;
+        if (n >= HITS_TO_START) {
+            c.active = true; c.outA = -1; c.outB = -1;
+            setCenter(c, v); c.endMs = now + COMBAT_MS;
+            String msg = "전투 모드 시작! 맞은 곳 기준 반경 50칸/높이 10칸 밖으로 3초 이상 나가면 사망합니다. (10분 후 자동 해제)";
+            say(att, msg, ChatFormatting.RED); say(v, msg, ChatFormatting.RED);
+        }
+    }
+
+    static void tickCombat(MinecraftServer s) {
+        long now = System.currentTimeMillis();
+        int tick = s.getTickCount();
+        for (Combat c : new ArrayList<>(combats)) {
+            if (!c.active) { if (now - c.lastMs > COMBAT_MS) combats.remove(c); continue; }
+            ServerPlayer pa = s.getPlayerList().getPlayer(c.a), pb = s.getPlayerList().getPlayer(c.b);
+            if (pa == null || pb == null || !pa.isAlive() || !pb.isAlive()) { combats.remove(c); continue; }
+            if (now > c.endMs) {
+                combats.remove(c);
+                say(pa, "전투 모드가 종료되었습니다.", ChatFormatting.GRAY); say(pb, "전투 모드가 종료되었습니다.", ChatFormatting.GRAY);
+                continue;
+            }
+            if (zoneCheck(s, c, pa, pb, true, tick)) { combats.remove(c); continue; }
+            if (zoneCheck(s, c, pb, pa, false, tick)) combats.remove(c);
+        }
+    }
+
+    static boolean zoneCheck(MinecraftServer s, Combat c, ServerPlayer p, ServerPlayer other, boolean isA, int tick) {
+        boolean inside = dimKey(p.level()).equals(c.dim)
+                && Math.hypot(p.getX() - c.x, p.getZ() - c.z) <= ZONE_R && Math.abs(p.getY() - c.y) <= ZONE_H;
+        long out = isA ? c.outA : c.outB;
+        if (inside) { if (isA) c.outA = -1; else c.outB = -1; return false; }
+        if (out < 0) { out = tick; if (isA) c.outA = out; else c.outB = out; }
+        long elapsed = tick - out;
+        if (elapsed >= OUT_TICKS) { killByZone(s, p, other); return true; }
+        int left = (int) Math.ceil((OUT_TICKS - elapsed) / 20.0);
+        p.sendSystemMessage(Component.literal("전투 구역을 벗어났습니다! " + left + "초 후 사망").withStyle(ChatFormatting.RED), true);
+        return false;
+    }
+
+    // 구역 이탈 사망: 머리 없이 아이템 드랍(데이터팩 wr_nohead), 상대에게 킬 +1
+    static void killByZone(MinecraftServer s, ServerPlayer dead, ServerPlayer killer) {
+        String dn = dead.getName().getString(), kn = killer.getName().getString();
+        cmd(s.overworld(), "scoreboard players set " + dn + " wr_nohead 1");
+        cmd(s.overworld(), "scoreboard players add " + kn + " wr_kills 1");
+        say(killer, "상대가 전투 구역을 벗어나 사망했습니다. 전투 모드가 종료됩니다.", ChatFormatting.GREEN);
+        cmd(s.overworld(), "kill " + dn);
+    }
+
+    // 전투 모드 중 접속 종료: 상대는 킬 +1 / 나간 사람은 머리 없이 아이템 드랍 후 사망
+    static void onDisconnect(ServerPlayer p) {
+        List<Combat> mine = new ArrayList<>();
+        for (Combat c : combats) if (c.active && (c.a.equals(p.getUUID()) || c.b.equals(p.getUUID()))) mine.add(c);
+        if (mine.isEmpty()) return;
+        for (Combat c : mine) {
+            UUID ou = c.a.equals(p.getUUID()) ? c.b : c.a;
+            ServerPlayer o = server.getPlayerList().getPlayer(ou);
+            if (o != null) {
+                say(o, "상대가 전투 중 접속을 종료했습니다. 연속킬이 올라가고 전투 모드가 종료됩니다.", ChatFormatting.GREEN);
+                cmd(server.overworld(), "execute as " + o.getName().getString() + " at @s run function wr:kill/streak_up");
+            }
+            combats.remove(c);
+        }
+        String nm = p.getName().getString();
+        if (p.level() instanceof ServerLevel lvl) {
+            int xp = p.totalExperience;
+            p.getInventory().dropAll();
+            while (xp > 0) {
+                int v = Math.min(xp, 30000);
+                cmd(lvl, "summon minecraft:experience_orb " + p.getX() + " " + (p.getY() + 0.3) + " " + p.getZ() + " {Value:" + v + "s}");
+                xp -= v;
+            }
+        }
+        cmd(server.overworld(), "experience set " + nm + " 0 levels");
+        cmd(server.overworld(), "experience set " + nm + " 0 points");
+        cmd(server.overworld(), "scoreboard players set " + nm + " wr_nograve 1");
+        cmd(server.overworld(), "kill " + nm);
     }
 }
