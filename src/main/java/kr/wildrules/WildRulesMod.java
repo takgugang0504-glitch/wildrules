@@ -79,6 +79,7 @@ public class WildRulesMod implements ModInitializer {
     static class Rec {
         String dim; int x, y, z; String owner; String ownerName;
         String effect;
+        int level = 1;
     }
     static class Data {
         Map<String, Integer> placed = new HashMap<>();
@@ -210,6 +211,18 @@ public class WildRulesMod implements ModInitializer {
         if (s.is(Items.NETHERITE_INGOT)) return "netherite";
         return null;
     }
+    static String blockKey(ItemStack s) {
+        if (s.is(Items.IRON_BLOCK)) return "iron";
+        if (s.is(Items.GOLD_BLOCK)) return "gold";
+        if (s.is(Items.EMERALD_BLOCK)) return "emerald";
+        if (s.is(Items.DIAMOND_BLOCK)) return "diamond";
+        if (s.is(Items.NETHERITE_BLOCK)) return "netherite";
+        return null;
+    }
+    static boolean inCombat(UUID id) {
+        for (Combat c : combats) if (c.active && (c.a.equals(id) || c.b.equals(id))) return true;
+        return false;
+    }
     static String ingotLabel(String k) {
         return switch (k) {
             case "iron" -> "철: 신속"; case "gold" -> "금: 성급함"; case "emerald" -> "에메랄드: 저항";
@@ -259,17 +272,19 @@ public class WildRulesMod implements ModInitializer {
             say(sp, "이 신호기는 " + r.ownerName + " 님의 것입니다.", ChatFormatting.GRAY);
             return;
         }
-        String key = ingotKey(held);
+        String key = blockKey(held);
+        int lvl = 3;                                           // 광물 블록 = 3단계
+        if (key == null) { key = ingotKey(held); lvl = 1; }    // 광물(주괴/에메랄드/다이아) = 1단계
         if (key != null) {
-            if (key.equals(r.effect)) { say(sp, "이미 적용 중인 버프입니다: " + ingotLabel(key), ChatFormatting.GRAY); return; }
+            if (key.equals(r.effect) && r.level == lvl) { say(sp, "이미 적용 중인 버프입니다: " + ingotLabel(key) + " (" + lvl + "단계)", ChatFormatting.GRAY); return; }
             if (!sp.getAbilities().instabuild) held.shrink(1);
-            r.effect = key;
+            r.effect = key; r.level = lvl;
             save();
-            say(sp, "신호기 버프 설정: " + ingotLabel(key), ChatFormatting.GREEN);
+            say(sp, "신호기 버프 설정: " + ingotLabel(key) + " (" + lvl + "단계)", ChatFormatting.GREEN);
             return;
         }
-        say(sp, r.effect == null ? "신호기 버프: 없음 (철/금/에메랄드/다이아/네더라이트를 우클릭으로 넣으세요)"
-                                 : "신호기 버프: " + ingotLabel(r.effect), ChatFormatting.AQUA);
+        say(sp, r.effect == null ? "신호기 버프: 없음 (광물=1단계, 광물 블록=3단계를 우클릭으로 넣으세요)"
+                                 : "신호기 버프: " + ingotLabel(r.effect) + " (" + r.level + "단계)", ChatFormatting.AQUA);
     }
 
     // 주인이 아니면 신호기를 부술 수 없음
@@ -385,11 +400,11 @@ public class WildRulesMod implements ModInitializer {
             String key = r.dim + r.x + "," + r.y + "," + r.z;
             if (owner == null) { flagged.remove(key); continue; }
 
-            // (1) 주인 버프: 주인이 근처에 있으면 선택한 광물의 버프가 계속 유지
-            if (r.effect != null && dimKey(owner.level()).equals(r.dim)
+            // (1) 주인 버프: 주인이 근처에 있으면 유지. 전투(PvP) 모드 중에는 받지 못함
+            if (r.effect != null && !inCombat(owner.getUUID()) && dimKey(owner.level()).equals(r.dim)
                     && owner.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) <= BUFF_RANGE * BUFF_RANGE) {
                 Holder<MobEffect> eff = effectOf(r.effect);
-                if (eff != null) owner.addEffect(new MobEffectInstance(eff, 60, 0, true, false, true));
+                if (eff != null) owner.addEffect(new MobEffectInstance(eff, 60, Math.max(0, r.level - 1), true, false, true));
             }
 
             // (2) 신호기 범위(100칸) 안의 주인 외 플레이어: 발광 + 주인에게 알림 (연속킬 5 이상은 빨간 글씨)
@@ -509,7 +524,10 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
-        if (e instanceof ServerPlayer && src.getEntity() instanceof ServerPlayer k && k != e) dragonReady.remove(k.getUUID());
+        if (e instanceof ServerPlayer && src.getEntity() instanceof ServerPlayer k && k != e) {
+            dragonReady.remove(k.getUUID());   // 플레이어를 죽이면 스킬 재사용 가능 + 쿨타임 표시 해제
+            try { k.getCooldowns().addCooldown(new ItemStack(Items.DRAGON_HEAD), 0); } catch (Exception ignored) { }
+        }
         if (e instanceof ServerPlayer dp) combats.removeIf(c -> c.a.equals(dp.getUUID()) || c.b.equals(dp.getUUID()));
         if (server == null || !(src.getEntity() instanceof ServerPlayer)) return;
         if (!(e.level() instanceof ServerLevel lvl)) return;
@@ -759,6 +777,7 @@ public class WildRulesMod implements ModInitializer {
         long until = now + 30L * 60L * 1000L;
         dragonReady.put(p.getUUID(), until);
         dragonActive.put(p.getUUID(), until);
+        try { p.getCooldowns().addCooldown(new ItemStack(Items.DRAGON_HEAD), 36000); } catch (Exception ignored) { }   // 30분: 아이템에 쿨타임 표시
         if (!(p.level() instanceof ServerLevel lvl)) return;
         cmd(lvl, "playsound minecraft:entity.ender_dragon.growl master @a " + p.getX() + " " + p.getY() + " " + p.getZ() + " 4 1");
         p.setHealth(p.getMaxHealth());
@@ -773,13 +792,13 @@ public class WildRulesMod implements ModInitializer {
             if (e instanceof ServerPlayer sp) sp.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket(sp));
             e.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, 12000, 0, false, true, true));  // 나약함 I, 10분
         }
-        say(p, "드래곤의 포효! 30분 동안 공격할 때마다 상대에게 위더가 걸립니다.", ChatFormatting.DARK_PURPLE);
+        say(p, "드래곤의 포효! 30분 동안 공격할 때마다 상대에게 위더 V가 3초 걸립니다.", ChatFormatting.DARK_PURPLE);
     }
     static void dragonHit(Entity a, LivingEntity victim) {
         if (!(a instanceof ServerPlayer ap) || victim == ap) return;
         Long until = dragonActive.get(ap.getUUID());
         if (until == null || System.currentTimeMillis() > until) return;
-        victim.addEffect(new MobEffectInstance(MobEffects.WITHER, 40, 1, false, true, true));     // 위더 II, 2초
+        victim.addEffect(new MobEffectInstance(MobEffects.WITHER, 60, 4, false, true, true));     // 위더 V, 3초
     }
 
     // ---------- 낚싯대: 끌어당기는 힘 강화 (엔티티에 걸려 있을 때 감을 때만) ----------
