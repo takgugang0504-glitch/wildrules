@@ -8,6 +8,7 @@ import com.google.gson.GsonBuilder;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerBlockEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
@@ -41,6 +42,8 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.LivingEntity;
@@ -67,7 +70,7 @@ import java.util.*;
 public class WildRulesMod implements ModInitializer {
     // ---- 설정값 ----
     static final int MAX_BEACONS = 3;            // 한 사람당 설치 가능 횟수
-    static final double DETECT_RANGE = 150.0;     // 감지 범위(칸)
+    static final double DETECT_RANGE = 100.0;     // 감지 범위(칸)
     static final int MIN_STREAK = 2;              // 이 연속킬 이상이면 감지 대상
     static final double BUFF_RANGE = 50.0;        // 주인 버프 범위(칸)
     static final String STREAK_OBJECTIVE = "wr_streak"; // 데이터팩의 연속킬 점수판
@@ -97,6 +100,13 @@ public class WildRulesMod implements ModInitializer {
     static final Map<UUID, Long> lastNotice = new HashMap<>();
     static final Set<UUID> banNotified = new HashSet<>();
     record Rm(String dim, BlockPos pos) { }
+    record Orb(ServerLevel level, double x, double y, double z, int value) { }
+    static final Map<UUID, Long> dragonReady = new HashMap<>();
+    static final Map<UUID, Long> dragonActive = new HashMap<>();
+    static final Map<UUID, Entity> hookedMap = new HashMap<>();
+    static final Set<UUID> handledBottles = new HashSet<>();
+    static final List<Entity> discardQueue = new ArrayList<>();
+    static final List<Orb> orbQueue = new ArrayList<>();
     // ---- 전투(PvP) 모드 ----
     static class Combat {
         UUID a, b; boolean active; int hitsA, hitsB;
@@ -131,6 +141,7 @@ public class WildRulesMod implements ModInitializer {
         ServerLivingEntityEvents.AFTER_DEATH.register(WildRulesMod::afterDeath);
         PlayerBlockBreakEvents.BEFORE.register(WildRulesMod::beforeBreak);
         AttackEntityCallback.EVENT.register(WildRulesMod::onAttack);
+        ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> onEntityLoad(entity, world));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, srv) -> {
             if (!srv.isRunning()) return;
             try { onDisconnect(handler.getPlayer()); } catch (Exception ex) { System.err.println("[wildrules] disconnect: " + ex); }
@@ -322,6 +333,13 @@ public class WildRulesMod implements ModInitializer {
                 cmd(rl, "setblock " + rm.pos().getX() + " " + rm.pos().getY() + " " + rm.pos().getZ() + " air");
             ri.remove();
         }
+        tickDragon(s);
+        tickHooks(s);
+        for (Entity en : discardQueue) if (!en.isRemoved()) en.discard();
+        discardQueue.clear();
+        for (Orb o : orbQueue) cmd(o.level(), "summon minecraft:experience_orb " + o.x() + " " + o.y() + " " + o.z() + " {Value:" + o.value() + "s}");
+        orbQueue.clear();
+        if (handledBottles.size() > 2000) handledBottles.clear();
         if (s.getTickCount() % 5 == 0) tickCombat(s);
         if (s.getTickCount() % 2 == 0) {
             tickHeads(s);
@@ -374,21 +392,19 @@ public class WildRulesMod implements ModInitializer {
                 if (eff != null) owner.addEffect(new MobEffectInstance(eff, 60, 0, true, false, true));
             }
 
-            // (2) 연속킬 MIN_STREAK 이상 플레이어 감지 (주인에게만 알림/표시)
+            // (2) 신호기 범위(100칸) 안의 주인 외 플레이어: 발광 + 주인에게 알림 (연속킬 5 이상은 빨간 글씨)
             Set<UUID> prev = flagged.getOrDefault(key, new HashSet<>());
             Set<UUID> cur = new HashSet<>();
             for (ServerPlayer t : s.getPlayerList().getPlayers()) {
                 if (t.getUUID().equals(owner.getUUID()) || t.isSpectator()) continue;
                 if (!dimKey(t.level()).equals(r.dim)) continue;
                 if (t.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) > DETECT_RANGE * DETECT_RANGE) continue;
-                if (streak(s, t) < MIN_STREAK) continue;
                 cur.add(t.getUUID());
+                t.addEffect(new MobEffectInstance(MobEffects.GLOWING, 40, 0, true, false, false));
                 if (!prev.contains(t.getUUID())) {
-                    say(owner, t.getName().getString() + " 님이 신호기 범위(" + (int) DETECT_RANGE + "칸)에 들어왔습니다.", ChatFormatting.RED);
-                }
-                if (dimKey(owner.level()).equals(r.dim) && owner.level() instanceof ServerLevel ol) {
-                    ol.sendParticles(owner, ParticleTypes.ANGRY_VILLAGER, true, true,
-                            t.getX(), t.getY() + 2.3, t.getZ(), 1, 0.2, 0.1, 0.2, 0.0);
+                    boolean big = streak(s, t) >= 5;
+                    say(owner, t.getName().getString() + " 님이 신호기 범위(" + (int) DETECT_RANGE + "칸)에 들어왔습니다." + (big ? " (연속킬 5 이상!)" : ""),
+                        big ? ChatFormatting.RED : ChatFormatting.YELLOW);
                 }
             }
             flagged.put(key, cur);
@@ -421,7 +437,10 @@ public class WildRulesMod implements ModInitializer {
     static boolean allowDamage(LivingEntity victim, DamageSource source, float amount) {
         if (server != null && victim.isBlocking() && source.getEntity() instanceof LivingEntity spearer
                 && itemId(spearer.getMainHandItem()).endsWith("_spear")) victim.stopUsingItem();   // 창: 방패 무시
-        if (server == null || !(victim instanceof ServerPlayer v)) return true;
+        if (server == null || !(victim instanceof ServerPlayer v)) {
+            if (server != null) dragonHit(source.getEntity(), victim);
+            return true;
+        }
         Entity a = source.getEntity();                 // 투사체면 쏜 사람
         if (!(a instanceof ServerPlayer att) || att == v) return true;   // 몹/환경 피해는 그대로
         if (score(server, v, "wr_prot") > 0) { notice(att, "상대는 무적 시간입니다", ChatFormatting.AQUA); return false; }
@@ -429,6 +448,7 @@ public class WildRulesMod implements ModInitializer {
         long left = banLeft(att.getUUID());
         if (left > 0) { notice(att, "PvP 금지 중 - 남은 시간 " + fmt(left), ChatFormatting.RED); return false; }
         combatHit(att, v);
+        dragonHit(att, v);
         return true;
     }
 
@@ -489,6 +509,7 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
+        if (e instanceof ServerPlayer && src.getEntity() instanceof ServerPlayer k && k != e) dragonReady.remove(k.getUUID());
         if (e instanceof ServerPlayer dp) combats.removeIf(c -> c.a.equals(dp.getUUID()) || c.b.equals(dp.getUUID()));
         if (server == null || !(src.getEntity() instanceof ServerPlayer)) return;
         if (!(e.level() instanceof ServerLevel lvl)) return;
@@ -568,23 +589,30 @@ public class WildRulesMod implements ModInitializer {
         if (!j.isJsonObject()) return false;
         JsonObject root = j.getAsJsonObject();
         JsonElement arr = root.get("damage_reductions");
-        if (arr == null || !arr.isJsonArray()) {          // 기본값(방패 100%)은 인코딩 시 생략됨 -> 80% 짜리를 직접 넣음
-            com.google.gson.JsonArray na = new com.google.gson.JsonArray();
-            JsonObject d = new JsonObject();
-            d.addProperty("horizontal_blocking_angle", 90.0);
-            d.addProperty("base", 0.0);
-            d.addProperty("factor", 0.8);
-            na.add(d);
-            root.add("damage_reductions", na);
-            return true;
+        if (arr != null && arr.isJsonArray() && arr.getAsJsonArray().size() == 2) {      // 이미 적용됨?
+            boolean has80 = false, hasProj = false;
+            for (JsonElement e : arr.getAsJsonArray()) {
+                if (!e.isJsonObject()) continue;
+                JsonObject o = e.getAsJsonObject();
+                if (o.has("type")) hasProj = true;
+                else if (o.has("factor") && Math.abs(o.get("factor").getAsDouble() - 0.8) < 0.001) has80 = true;
+            }
+            if (has80 && hasProj) return false;
         }
-        boolean ch = false;
-        for (JsonElement e : arr.getAsJsonArray()) {
-            if (!e.isJsonObject()) continue;
-            JsonObject o = e.getAsJsonObject();
-            if (!o.has("factor") || Math.abs(o.get("factor").getAsDouble() - 0.8) > 0.001) { o.addProperty("factor", 0.8); ch = true; }
-        }
-        return ch;
+        com.google.gson.JsonArray na = new com.google.gson.JsonArray();
+        JsonObject all = new JsonObject();                    // 모든 피해: 80% 감소
+        all.addProperty("horizontal_blocking_angle", 90.0);
+        all.addProperty("base", 0.0);
+        all.addProperty("factor", 0.8);
+        na.add(all);
+        JsonObject proj = new JsonObject();                   // 투사체(활 등): 합산되어 100% 막힘
+        proj.addProperty("horizontal_blocking_angle", 90.0);
+        proj.addProperty("type", "#minecraft:is_projectile");
+        proj.addProperty("base", 0.0);
+        proj.addProperty("factor", 1.0);
+        na.add(proj);
+        root.add("damage_reductions", na);
+        return true;
     }
     static boolean maceEdit(JsonElement j) {
         if (!j.isJsonObject()) return false;
@@ -684,5 +712,93 @@ public class WildRulesMod implements ModInitializer {
         cmd(server.overworld(), "experience set " + nm + " 0 points");
         cmd(server.overworld(), "scoreboard players set " + nm + " wr_nograve 1");
         cmd(server.overworld(), "kill " + nm);
+    }
+
+    // ---------- 경험치 병: 병 하나 = 던진 사람의 다음 1레벨 분량 ----------
+    static void onEntityLoad(Entity entity, ServerLevel world) {
+        String id = typeId(entity);
+        if (id.equals("minecraft:experience_orb")) {
+            for (Entity b : world.getEntitiesOfClass(Entity.class, entity.getBoundingBox().inflate(2.5))) {
+                if (!typeId(b).equals("minecraft:experience_bottle")) continue;
+                discardQueue.add(entity);
+                if (handledBottles.add(b.getUUID())) {
+                    int v = 7;
+                    if (b instanceof Projectile pr && pr.getOwner() instanceof ServerPlayer op)
+                        v = Math.max(1, Math.min(32000, op.getXpNeededForNextLevel()));
+                    orbQueue.add(new Orb(world, b.getX(), b.getY(), b.getZ(), v));
+                }
+                return;
+            }
+            return;
+        }
+        // 신호기 100칸 안에서는 몬스터 생성 금지
+        if (data.beacons.isEmpty()) return;
+        if (entity.getType().getCategory() != MobCategory.MONSTER) return;
+        if (id.equals("minecraft:wither") || id.equals("minecraft:ender_dragon")) return;
+        String dim = dimKey(world);
+        for (Rec r : data.beacons) {
+            if (r.dim.equals(dim) && entity.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) <= DETECT_RANGE * DETECT_RANGE) {
+                discardQueue.add(entity);
+                return;
+            }
+        }
+    }
+
+    // ---------- 드래곤 머리 ----------
+    static void tickDragon(MinecraftServer s) {
+        long now = System.currentTimeMillis();
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            if (!p.isAlive() || !p.getItemBySlot(EquipmentSlot.HEAD).is(Items.DRAGON_HEAD)) continue;
+            if (p.getHealth() > 6.0F) continue;                         // 체력 3칸(하트 3개) 이하일 때만
+            Long ready = dragonReady.get(p.getUUID());
+            if (ready != null && now < ready) continue;                  // 30분에 한 번 (킬 시 초기화)
+            activateDragon(p, now);
+        }
+    }
+    static void activateDragon(ServerPlayer p, long now) {
+        long until = now + 30L * 60L * 1000L;
+        dragonReady.put(p.getUUID(), until);
+        dragonActive.put(p.getUUID(), until);
+        if (!(p.level() instanceof ServerLevel lvl)) return;
+        cmd(lvl, "playsound minecraft:entity.ender_dragon.growl master @a " + p.getX() + " " + p.getY() + " " + p.getZ() + " 4 1");
+        p.setHealth(p.getMaxHealth());
+        p.addEffect(new MobEffectInstance(MobEffects.ABSORPTION, 36000, 4, false, true, true));   // 하트 한 줄(20) 추가
+        Vec3 c = p.position();
+        for (LivingEntity e : lvl.getEntitiesOfClass(LivingEntity.class, p.getBoundingBox().inflate(10.0))) {
+            if (e == p) continue;
+            Vec3 d = e.position().subtract(c);
+            double h = Math.sqrt(d.x * d.x + d.z * d.z);
+            double nx = h < 0.01 ? 1.0 : d.x / h, nz = h < 0.01 ? 0.0 : d.z / h;
+            e.push(nx * 2.5, 0.9, nz * 2.5);
+            if (e instanceof ServerPlayer sp) sp.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket(sp));
+            e.addEffect(new MobEffectInstance(MobEffects.WEAKNESS, 12000, 0, false, true, true));  // 나약함 I, 10분
+        }
+        say(p, "드래곤의 포효! 30분 동안 공격할 때마다 상대에게 위더가 걸립니다.", ChatFormatting.DARK_PURPLE);
+    }
+    static void dragonHit(Entity a, LivingEntity victim) {
+        if (!(a instanceof ServerPlayer ap) || victim == ap) return;
+        Long until = dragonActive.get(ap.getUUID());
+        if (until == null || System.currentTimeMillis() > until) return;
+        victim.addEffect(new MobEffectInstance(MobEffects.WITHER, 40, 1, false, true, true));     // 위더 II, 2초
+    }
+
+    // ---------- 낚싯대: 끌어당기는 힘 강화 (엔티티에 걸려 있을 때 감을 때만) ----------
+    static void tickHooks(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            var hook = p.fishing;
+            Entity he = hook == null ? null : hook.getHookedIn();
+            if (he != null) { hookedMap.put(p.getUUID(), he); continue; }
+            Entity prev = hookedMap.remove(p.getUUID());
+            if (prev != null && prev.isAlive() && !prev.isRemoved()) pullBoost(p, prev);
+        }
+    }
+    static void pullBoost(ServerPlayer p, Entity e) {
+        Vec3 d = p.position().subtract(e.position());
+        double dist = d.length();
+        if (dist < 0.5) return;
+        double sp = Math.min(1.6, 0.45 + dist * 0.18);
+        Vec3 n = d.scale(1.0 / dist);
+        e.push(n.x * sp, Math.max(0.35, n.y * sp + 0.3), n.z * sp);
+        if (e instanceof ServerPlayer tp) tp.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket(tp));
     }
 }
