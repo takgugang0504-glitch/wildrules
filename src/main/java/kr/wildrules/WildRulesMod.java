@@ -345,7 +345,10 @@ public class WildRulesMod implements ModInitializer {
             for (Map.Entry<UUID, Integer> e : new ArrayList<>(shieldPending.entrySet())) {
                 ServerPlayer tp = s.getPlayerList().getPlayer(e.getKey());
                 if (tp != null) for (ItemStack st : List.of(tp.getOffhandItem(), tp.getMainHandItem()))
-                    if (st.is(Items.SHIELD) && tp.getCooldowns().isOnCooldown(st)) tp.getCooldowns().addCooldown(st, e.getValue());
+                    if (st.is(Items.SHIELD) && (tp.getCooldowns().isOnCooldown(st) || !tp.isUsingItem())) {
+                        tp.getCooldowns().addCooldown(st, e.getValue());
+                        tp.stopUsingItem();
+                    }
             }
             shieldPending.clear();
         }
@@ -461,6 +464,11 @@ public class WildRulesMod implements ModInitializer {
     }
     static String fmt(long ms) { long m = ms / 60000L; return (m / 60) + "시간 " + (m % 60) + "분"; }
     static boolean allowDamage(LivingEntity victim, DamageSource source, float amount) {
+        if (server != null && victim instanceof ServerPlayer vp && vp.isBlocking()
+                && source.getDirectEntity() == source.getEntity() && source.getEntity() instanceof LivingEntity axeman) {
+            Integer sec = AXE_SECONDS.get(itemId(axeman.getMainHandItem()));
+            if (sec != null) shieldPending.put(vp.getUUID(), sec * 20);          // 도끼 등급별 방패 무력화 시간
+        }
         if (server != null && victim.isBlocking() && source.getEntity() instanceof LivingEntity spearer
                 && itemId(spearer.getMainHandItem()).endsWith("_spear")) victim.stopUsingItem();   // 창: 방패 무시
         if (server == null || !(victim instanceof ServerPlayer v)) {
