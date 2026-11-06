@@ -242,6 +242,15 @@ public class WildRulesMod implements ModInitializer {
             return InteractionResult.FAIL;
         }
         if (held.is(Items.ENDER_CHEST)) { held.shrink(1); return InteractionResult.FAIL; }
+        if (held.is(Items.TNT) && sp.getItemBySlot(EquipmentSlot.HEAD).is(Items.CREEPER_HEAD)) {
+            BlockPlaceContext tc = new BlockPlaceContext(player, hand, held, hit);
+            if (tc.canPlace() && level instanceof ServerLevel tl) {
+                BlockPos tp = tc.getClickedPos();
+                if (!sp.getAbilities().instabuild) held.shrink(1);
+                tl.explode(sp, tp.getX() + 0.5, tp.getY() + 0.5, tp.getZ() + 0.5, 4.0F, Level.ExplosionInteraction.NONE);
+                return InteractionResult.FAIL;
+            }
+        }
         // 1) 신호기 우클릭: 바닐라 GUI(효과 선택)를 막고 광물 투입/상태 표시
         if (level.getBlockState(pos).is(Blocks.BEACON) && !player.isShiftKeyDown()) {
             useBeacon(sp, level, pos, held);
@@ -350,10 +359,12 @@ public class WildRulesMod implements ModInitializer {
         }
         tickDragon(s);
         tickHooks(s);
-        for (Entity en : discardQueue) if (!en.isRemoved()) en.discard();
+        List<Entity> dq = new ArrayList<>(discardQueue);
         discardQueue.clear();
-        for (Orb o : orbQueue) cmd(o.level(), "summon minecraft:experience_orb " + o.x() + " " + o.y() + " " + o.z() + " {Value:" + o.value() + "s}");
+        for (Entity en : dq) if (!en.isRemoved()) en.discard();
+        List<Orb> oq = new ArrayList<>(orbQueue);
         orbQueue.clear();
+        for (Orb o : oq) cmd(o.level(), "summon minecraft:experience_orb " + o.x() + " " + o.y() + " " + o.z() + " {Value:" + o.value() + "s}");
         if (handledBottles.size() > 2000) handledBottles.clear();
         if (s.getTickCount() % 5 == 0) tickCombat(s);
         if (s.getTickCount() % 2 == 0) {
@@ -524,6 +535,16 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
+        if (server != null && e instanceof ServerPlayer dp) {
+            String n = dp.getName().getString(), dm = dimKey(dp.level());
+            int di = dm.contains("the_nether") ? 1 : dm.contains("the_end") ? 2 : 0;
+            ServerLevel o = server.overworld();
+            cmd(o, "scoreboard players set " + n + " wr_dx " + (int) Math.floor(dp.getX()));
+            cmd(o, "scoreboard players set " + n + " wr_dy " + (int) Math.floor(dp.getY()));
+            cmd(o, "scoreboard players set " + n + " wr_dz " + (int) Math.floor(dp.getZ()));
+            cmd(o, "scoreboard players set " + n + " wr_ddim " + di);
+            cmd(o, "scoreboard players set " + n + " wr_dvalid 1");
+        }
         if (e instanceof ServerPlayer && src.getEntity() instanceof ServerPlayer k && k != e) {
             dragonReady.remove(k.getUUID());   // 플레이어를 죽이면 스킬 재사용 가능 + 쿨타임 표시 해제
             try { k.getCooldowns().addCooldown(new ItemStack(Items.DRAGON_HEAD), 0); } catch (Exception ignored) { }
@@ -578,18 +599,21 @@ public class WildRulesMod implements ModInitializer {
         T neu = codec.parse(ops, j).getOrThrow();
         st.set(type, neu);
     }
+    static void fixStack(MinecraftServer s, ServerPlayer p, ItemStack st) {
+        if (st.isEmpty()) return;
+        try {
+            if (st.is(Items.SHIELD)) patch(s, st, DataComponents.BLOCKS_ATTACKS, WildRulesMod::shieldEdit);
+            clampMace(st);
+        } catch (Exception ex) {
+            if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] item patch failed: " + ex); say(p, "[wildrules] 아이템 패치 실패: " + ex, ChatFormatting.RED); }
+        }
+    }
     static void patchInventory(MinecraftServer s, ServerPlayer p) {
         Inventory inv = p.getInventory();
-        for (int i = 0; i < inv.getContainerSize(); i++) {
-            ItemStack st = inv.getItem(i);
-            if (st.isEmpty()) continue;
-            try {
-                if (st.is(Items.SHIELD)) patch(s, st, DataComponents.BLOCKS_ATTACKS, WildRulesMod::shieldEdit);
-                clampMace(st);
-            } catch (Exception ex) {
-                if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] item patch failed: " + ex); say(p, "[wildrules] 방패 패치 실패: " + ex, ChatFormatting.RED); }
-            }
-        }
+        for (int i = 0; i < inv.getContainerSize(); i++) fixStack(s, p, inv.getItem(i));
+        for (EquipmentSlot es : new EquipmentSlot[]{EquipmentSlot.MAINHAND, EquipmentSlot.OFFHAND, EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET})
+            fixStack(s, p, p.getItemBySlot(es));
+        try { for (var slot : p.containerMenu.slots) fixStack(s, p, slot.getItem()); } catch (Exception ignored) { }
     }
     static boolean patchWarned = false;
     static void clampMace(ItemStack st) {
@@ -735,6 +759,15 @@ public class WildRulesMod implements ModInitializer {
     // ---------- 경험치 병: 병 하나 = 던진 사람의 다음 1레벨 분량 ----------
     static void onEntityLoad(Entity entity, ServerLevel world) {
         String id = typeId(entity);
+        if ((id.equals("minecraft:arrow") || id.equals("minecraft:spectral_arrow")) && entity.tickCount == 0
+                && entity instanceof Projectile ap && ap.getOwner() instanceof ServerPlayer shooter
+                && shooter.getItemBySlot(EquipmentSlot.HEAD).is(Items.SKELETON_SKULL)
+                && shooter.getMainHandItem().is(Items.BOW)) {
+            Vec3 v = entity.getDeltaMovement();
+            double sp = v.length();
+            if (sp > 1.5) entity.setDeltaMovement(v.scale(3.15 / sp));        // 석궁과 같은 속도(거리)
+            return;
+        }
         if (id.equals("minecraft:experience_orb")) {
             for (Entity b : world.getEntitiesOfClass(Entity.class, entity.getBoundingBox().inflate(2.5))) {
                 if (!typeId(b).equals("minecraft:experience_bottle")) continue;
