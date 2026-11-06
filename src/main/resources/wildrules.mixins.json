@@ -4,7 +4,8 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "EnchantmentMixin",
-    "EndCrystalMixin"
+    "EndCrystalMixin",
+    "MobTargetMixin"
   ],
   "injectors": {
     "defaultRequire": 0

@@ -115,7 +115,8 @@ public class WildRulesMod implements ModInitializer {
     }
     static final List<Combat> combats = new ArrayList<>();
     static final long COMBAT_MS = 10L * 60L * 1000L;   // 전투 모드 지속(마지막 타격 후 10분)
-    static final int HITS_TO_START = 5;                // 이 횟수 이상 때리면 전투 모드
+    static final int HITS_TO_START = 3;                // 이 횟수 이상 때리면 전투 모드
+    static final long HIT_WINDOW_MS = 10_000L;         // 마지막 타격 후 10초 지나면 타격 횟수 초기화
     static final double ZONE_R = 50.0, ZONE_H = 10.0;  // 구역 반경/높이
     static final int OUT_TICKS = 60;                   // 구역 밖 3초
     static final List<Rm> removeQueue = new ArrayList<>();
@@ -360,8 +361,8 @@ public class WildRulesMod implements ModInitializer {
                 cmd(rl, "setblock " + rm.pos().getX() + " " + rm.pos().getY() + " " + rm.pos().getZ() + " air");
             ri.remove();
         }
-        tickDragon(s);
-        tickHooks(s);
+        safe(() -> tickDragon(s), "dragon");
+        safe(() -> tickHooks(s), "hooks");
         List<Entity> dq = new ArrayList<>(discardQueue);
         discardQueue.clear();
         for (Entity en : dq) if (!en.isRemoved()) en.discard();
@@ -369,9 +370,10 @@ public class WildRulesMod implements ModInitializer {
         orbQueue.clear();
         for (Orb o : oq) cmd(o.level(), "summon minecraft:experience_orb " + o.x() + " " + o.y() + " " + o.z() + " {Value:" + o.value() + "s}");
         if (handledBottles.size() > 2000) handledBottles.clear();
-        if (s.getTickCount() % 5 == 0) tickCombat(s);
+        if (s.getTickCount() % 5 == 0) safe(() -> tickCombat(s), "combat");
         if (s.getTickCount() % 2 == 0) {
-            tickHeads(s);
+            safe(() -> tickHeads(s), "heads");
+            safe(() -> tickSmelt(s), "smelt");
             for (ServerPlayer cp : s.getPlayerList().getPlayers()) {
                 try { for (var slot : cp.containerMenu.slots) clampMace(slot.getItem()); }
                 catch (Exception ex) { if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] mace clamp failed: " + ex); } }
@@ -464,6 +466,7 @@ public class WildRulesMod implements ModInitializer {
     }
     static String fmt(long ms) { long m = ms / 60000L; return (m / 60) + "시간 " + (m % 60) + "분"; }
     static boolean allowDamage(LivingEntity victim, DamageSource source, float amount) {
+        if (server != null && victim instanceof ServerPlayer bp && bp.isBlocking()) fixStack(server, bp, bp.getUseItem());   // 막기 직전에 방패 규칙 보장
         if (server != null && victim instanceof ServerPlayer vp && vp.isBlocking()
                 && source.getDirectEntity() == source.getEntity() && source.getEntity() instanceof LivingEntity axeman) {
             Integer sec = AXE_SECONDS.get(itemId(axeman.getMainHandItem()));
@@ -518,7 +521,10 @@ public class WildRulesMod implements ModInitializer {
         return k == null ? "" : k.toString();
     }
     static final Set<String> ZOMBIES = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombie_villager");
-    static final Set<String> SKELETONS = Set.of("minecraft:skeleton", "minecraft:stray", "minecraft:bogged");
+    static final Set<String> SKELETONS = Set.of("minecraft:skeleton", "minecraft:stray", "minecraft:bogged", "minecraft:parched");
+    static final Set<String> PIGLIN_IGNORE = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:stray", "minecraft:skeleton", "minecraft:parched",
+        "minecraft:creeper", "minecraft:spider", "minecraft:piglin", "minecraft:piglin_brute", "minecraft:hoglin", "minecraft:wither_skeleton",
+        "minecraft:magma_cube", "minecraft:blaze", "minecraft:slime");
     static final Set<String> UNDEAD = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombie_villager",
         "minecraft:zombified_piglin", "minecraft:skeleton", "minecraft:stray", "minecraft:bogged", "minecraft:wither_skeleton",
         "minecraft:wither", "minecraft:zoglin", "minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:phantom");
@@ -528,8 +534,33 @@ public class WildRulesMod implements ModInitializer {
         if (head.is(Items.SKELETON_SKULL)) return SKELETONS.contains(id);
         if (head.is(Items.CREEPER_HEAD)) return id.equals("minecraft:creeper");
         if (head.is(Items.WITHER_SKELETON_SKULL)) return id.equals("minecraft:wither_skeleton");
-        if (head.is(Items.PIGLIN_HEAD)) return UNDEAD.contains(id);
+        if (head.is(Items.PIGLIN_HEAD)) return PIGLIN_IGNORE.contains(id);
         return false;
+    }
+    /** 머리를 쓴 플레이어를 해당 몹이 목표로 삼지 못하게 하는 판정 (MobTargetMixin 이 사용) */
+    public static boolean ignoresTarget(Mob m, LivingEntity target) {
+        if (!(target instanceof ServerPlayer p)) return false;
+        ItemStack head = p.getItemBySlot(EquipmentSlot.HEAD);
+        return !head.isEmpty() && ignores(head, m);
+    }
+    static net.minecraft.world.item.Item smelted(ItemStack st) {
+        if (st.is(Items.RAW_IRON) || st.is(Items.IRON_ORE) || st.is(Items.DEEPSLATE_IRON_ORE)) return Items.IRON_INGOT;
+        if (st.is(Items.RAW_GOLD) || st.is(Items.GOLD_ORE) || st.is(Items.DEEPSLATE_GOLD_ORE) || st.is(Items.NETHER_GOLD_ORE)) return Items.GOLD_INGOT;
+        if (st.is(Items.RAW_COPPER) || st.is(Items.COPPER_ORE) || st.is(Items.DEEPSLATE_COPPER_ORE)) return Items.COPPER_INGOT;
+        if (st.is(Items.ANCIENT_DEBRIS)) return Items.NETHERITE_SCRAP;
+        return null;
+    }
+    static void tickSmelt(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            if (!p.getItemBySlot(EquipmentSlot.HEAD).is(Items.PIGLIN_HEAD)) continue;
+            Inventory inv = p.getInventory();
+            for (int i = 0; i < inv.getContainerSize(); i++) {
+                ItemStack st = inv.getItem(i);
+                if (st.isEmpty()) continue;
+                var out = smelted(st);
+                if (out != null) inv.setItem(i, new ItemStack(out, st.getCount()));
+            }
+        }
     }
     static void tickHeads(MinecraftServer s) {
         for (ServerPlayer p : s.getPlayerList().getPlayers()) {
@@ -597,21 +628,23 @@ public class WildRulesMod implements ModInitializer {
     }
 
     // ---------- 방패 피해 감소 80% / 철퇴 날카로움 최대 5 ----------
-    static <T> void patch(MinecraftServer s, ItemStack st, DataComponentType<T> type, java.util.function.Predicate<JsonElement> edit) {
+    static <T> boolean patch(MinecraftServer s, ItemStack st, DataComponentType<T> type, java.util.function.Predicate<JsonElement> edit) {
         T cur = st.get(type);
-        if (cur == null) return;
+        if (cur == null) return false;
         var ops = RegistryOps.create(JsonOps.INSTANCE, s.registryAccess());
         var codec = type.codecOrThrow();
         JsonElement j = codec.encodeStart(ops, cur).getOrThrow();
-        if (!edit.test(j)) return;
+        if (!edit.test(j)) return false;
         T neu = codec.parse(ops, j).getOrThrow();
         st.set(type, neu);
+        return true;
     }
     static void fixStack(MinecraftServer s, ServerPlayer p, ItemStack st) {
         if (st.isEmpty()) return;
         try {
-            if (st.is(Items.SHIELD)) patch(s, st, DataComponents.BLOCKS_ATTACKS, WildRulesMod::shieldEdit);
+            boolean ch = st.is(Items.SHIELD) && patch(s, st, DataComponents.BLOCKS_ATTACKS, WildRulesMod::shieldEdit);
             clampMace(st);
+            if (ch && shieldNotified.add(p.getUUID())) say(p, "[wildrules] 방패 효과 적용됨 (공격 80% 경감, 활/투사체 100% 차단)", ChatFormatting.GRAY);
         } catch (Exception ex) {
             if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] item patch failed: " + ex); say(p, "[wildrules] 아이템 패치 실패: " + ex, ChatFormatting.RED); }
         }
@@ -622,6 +655,12 @@ public class WildRulesMod implements ModInitializer {
         for (EquipmentSlot es : new EquipmentSlot[]{EquipmentSlot.MAINHAND, EquipmentSlot.OFFHAND, EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET})
             fixStack(s, p, p.getItemBySlot(es));
         try { for (var slot : p.containerMenu.slots) fixStack(s, p, slot.getItem()); } catch (Exception ignored) { }
+    }
+    static final Set<UUID> shieldNotified = new HashSet<>();
+    static final Set<String> warnedTasks = new HashSet<>();
+    static void safe(Runnable r, String name) {
+        try { r.run(); }
+        catch (Throwable ex) { if (warnedTasks.add(name)) { System.err.println("[wildrules] " + name + " failed: " + ex); ex.printStackTrace(); } }
     }
     static boolean patchWarned = false;
     static void clampMace(ItemStack st) {
@@ -674,6 +713,9 @@ public class WildRulesMod implements ModInitializer {
     }
 
     // ---------- 전투(PvP) 모드 ----------
+    static void pvpBar(ServerPlayer p, long secs) {
+        p.sendSystemMessage(Component.literal("PVP 활성화 끝나기 전까지 " + secs + "초").withStyle(ChatFormatting.RED), true);
+    }
     static void setCenter(Combat c, ServerPlayer v) { c.dim = dimKey(v.level()); c.x = v.getX(); c.y = v.getY(); c.z = v.getZ(); }
 
     static void combatHit(ServerPlayer att, ServerPlayer v) {
@@ -682,7 +724,7 @@ public class WildRulesMod implements ModInitializer {
         for (Combat q : combats)
             if ((q.a.equals(att.getUUID()) && q.b.equals(v.getUUID())) || (q.a.equals(v.getUUID()) && q.b.equals(att.getUUID()))) { c = q; break; }
         if (c == null) { c = new Combat(); c.a = att.getUUID(); c.b = v.getUUID(); combats.add(c); }
-        if (!c.active && now - c.lastMs > COMBAT_MS) { c.hitsA = 0; c.hitsB = 0; }
+        if (!c.active && now - c.lastMs > HIT_WINDOW_MS) { c.hitsA = 0; c.hitsB = 0; }
         c.lastMs = now;
         if (c.active) { setCenter(c, v); c.endMs = now + COMBAT_MS; return; }   // 서로 때릴 때마다 구역 이동 + 10분 리셋
         boolean fromA = c.a.equals(att.getUUID());
@@ -690,8 +732,7 @@ public class WildRulesMod implements ModInitializer {
         if (n >= HITS_TO_START) {
             c.active = true; c.outA = -1; c.outB = -1;
             setCenter(c, v); c.endMs = now + COMBAT_MS;
-            String msg = "전투 모드 시작! 맞은 곳 기준 반경 50칸/높이 10칸 밖으로 3초 이상 나가면 사망합니다. (10분 후 자동 해제)";
-            say(att, msg, ChatFormatting.RED); say(v, msg, ChatFormatting.RED);
+            pvpBar(att, COMBAT_MS / 1000); pvpBar(v, COMBAT_MS / 1000);
         }
     }
 
@@ -699,16 +740,20 @@ public class WildRulesMod implements ModInitializer {
         long now = System.currentTimeMillis();
         int tick = s.getTickCount();
         for (Combat c : new ArrayList<>(combats)) {
-            if (!c.active) { if (now - c.lastMs > COMBAT_MS) combats.remove(c); continue; }
+            if (!c.active) { if (now - c.lastMs > HIT_WINDOW_MS) combats.remove(c); continue; }
             ServerPlayer pa = s.getPlayerList().getPlayer(c.a), pb = s.getPlayerList().getPlayer(c.b);
             if (pa == null || pb == null || !pa.isAlive() || !pb.isAlive()) { combats.remove(c); continue; }
             if (now > c.endMs) {
                 combats.remove(c);
-                say(pa, "전투 모드가 종료되었습니다.", ChatFormatting.GRAY); say(pb, "전투 모드가 종료되었습니다.", ChatFormatting.GRAY);
+                pa.sendSystemMessage(Component.literal("PVP 활성화가 종료되었습니다").withStyle(ChatFormatting.GRAY), true);
+                pb.sendSystemMessage(Component.literal("PVP 활성화가 종료되었습니다").withStyle(ChatFormatting.GRAY), true);
                 continue;
             }
             if (zoneCheck(s, c, pa, pb, true, tick)) { combats.remove(c); continue; }
-            if (zoneCheck(s, c, pb, pa, false, tick)) combats.remove(c);
+            if (zoneCheck(s, c, pb, pa, false, tick)) { combats.remove(c); continue; }
+            long secs = Math.max(0, (c.endMs - now + 999) / 1000);
+            if (c.outA < 0) pvpBar(pa, secs);      // 구역 안: PVP 남은 시간 표시 (구역 밖이면 이탈 경고가 우선)
+            if (c.outB < 0) pvpBar(pb, secs);
         }
     }
 
