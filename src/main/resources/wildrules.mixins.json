@@ -6,7 +6,8 @@
     "EnchantmentMixin",
     "EndCrystalMixin",
     "MobTargetMixin",
-    "AnvilMenuMixin"
+    "AnvilCapMixin",
+    "AnvilCostMixin"
   ],
   "injectors": {
     "defaultRequire": 0
