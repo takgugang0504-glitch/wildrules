@@ -11,6 +11,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerBlockEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
+import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
@@ -48,7 +50,6 @@ import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
@@ -108,6 +109,11 @@ public class WildRulesMod implements ModInitializer {
     record Rm(String dim, BlockPos pos) { }
     record Orb(ServerLevel level, double x, double y, double z, int value) { }
     record ArrowTrack(Entity arrow, double x, double y, double z) { }
+    record LastPos(String dim, double x, double y, double z) { }
+    static class Boost { Entity e; double fly = -1, mov = -1; }
+    static final Map<UUID, LastPos> lastPos = new HashMap<>();
+    static final Set<UUID> returning = new HashSet<>();
+    static final Map<UUID, Boost> ghastBoost = new HashMap<>();
     record Delayed(ServerLevel level, double x, double y, double z, int value, int due) { }
     static final List<ArrowTrack> arrowTracks = new ArrayList<>();
     static final List<Delayed> delayedOrbs = new ArrayList<>();
@@ -148,13 +154,23 @@ public class WildRulesMod implements ModInitializer {
     public void onInitialize() {
         file = FabricLoader.getInstance().getConfigDir().resolve("wildrules-beacons.json");
         ServerLifecycleEvents.SERVER_STARTED.register(s -> { server = s; load(); });
-        ServerLifecycleEvents.SERVER_STOPPING.register(s -> save());
+        ServerLifecycleEvents.SERVER_STOPPING.register(s -> { save(); restoreGhasts(); });
         UseBlockCallback.EVENT.register(WildRulesMod::onUse);
         ServerTickEvents.END_SERVER_TICK.register(WildRulesMod::onTick);
         ServerLivingEntityEvents.ALLOW_DAMAGE.register(WildRulesMod::allowDamage);
         ServerLivingEntityEvents.AFTER_DEATH.register(WildRulesMod::afterDeath);
         PlayerBlockBreakEvents.BEFORE.register(WildRulesMod::beforeBreak);
         AttackEntityCallback.EVENT.register(WildRulesMod::onAttack);
+        ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, origin, destination) -> onChangeWorld(player));
+        AttackBlockCallback.EVENT.register((pl, lvl, hand, pos, dir) -> {      // 신호기는 주인만 부술 수 있음 (채굴 시작 단계에서 차단)
+            if (lvl.isClientSide() || !lvl.getBlockState(pos).is(Blocks.BEACON)) return InteractionResult.PASS;
+            Rec r = find(dimKey(lvl), pos);
+            if (r != null && !r.owner.equals(pl.getUUID().toString())) {
+                if (pl instanceof ServerPlayer sp) notice(sp, "다른 사람의 신호기는 부술 수 없습니다", ChatFormatting.RED);
+                return InteractionResult.FAIL;
+            }
+            return InteractionResult.PASS;
+        });
         ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> onEntityLoad(entity, world));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, srv) -> {
             if (!srv.isRunning()) return;
@@ -415,6 +431,7 @@ public class WildRulesMod implements ModInitializer {
         }
         if (s.getTickCount() % 5 == 0) { safe(() -> tickCombat(s), "combat"); safe(() -> tickTotems(s), "totems"); }
         if (s.getTickCount() % 20 == 0) safe(() -> tickWolves(s), "wolves");
+        if (s.getTickCount() % 10 == 0) safe(() -> tickGhasts(s), "ghasts");
         if (s.getTickCount() % 2 == 0) {
             safe(() -> tickHeads(s), "heads");
             safe(() -> tickSmelt(s), "smelt");
@@ -799,6 +816,8 @@ public class WildRulesMod implements ModInitializer {
                 pb.sendSystemMessage(Component.literal("PVP 활성화가 종료되었습니다").withStyle(ChatFormatting.GRAY), true);
                 continue;
             }
+            lastPos.put(pa.getUUID(), new LastPos(dimKey(pa.level()), pa.getX(), pa.getY(), pa.getZ()));
+            lastPos.put(pb.getUUID(), new LastPos(dimKey(pb.level()), pb.getX(), pb.getY(), pb.getZ()));
             if (zoneCheck(s, c, pa, pb, true, tick)) { combats.remove(c); continue; }
             if (zoneCheck(s, c, pb, pa, false, tick)) { combats.remove(c); continue; }
             long secs = Math.max(0, (c.endMs - now + 999) / 1000);
@@ -982,10 +1001,8 @@ public class WildRulesMod implements ModInitializer {
                 if (count + st.getCount() > 3) {
                     ItemStack copy = st.copy();
                     inv.setItem(i, ItemStack.EMPTY);
-                    ItemEntity ie = new ItemEntity(p.level(), p.getX(), p.getEyeY() - 0.3, p.getZ(), copy);
-                    ie.setDeltaMovement(p.getLookAngle().scale(0.25));
-                    ie.setPickUpDelay(60);
-                    p.level().addFreshEntity(ie);
+                    var ie = p.drop(copy, true);
+                    if (ie != null) ie.setPickUpDelay(60);
                     dropped = true;
                 } else count += st.getCount();
             }
@@ -1008,6 +1025,54 @@ public class WildRulesMod implements ModInitializer {
                 m.addEffect(new MobEffectInstance(MobEffects.RESISTANCE, 100, 0, true, false, false));
                 m.addEffect(new MobEffectInstance(MobEffects.STRENGTH, 100, 1, true, false, false));
             }
+        }
+    }
+
+    // ---------- 전투(PVP) 중 차원 이동 금지: 이동 직후 원래 위치로 되돌림 ----------
+    static void onChangeWorld(ServerPlayer p) {
+        if (server == null || returning.contains(p.getUUID()) || !inCombat(p.getUUID())) return;
+        LastPos lp = lastPos.get(p.getUUID());
+        if (lp == null) return;
+        returning.add(p.getUUID());
+        try {
+            String d = lp.dim();
+            String id = d.substring(d.lastIndexOf("/ ") + 2, d.length() - 1);
+            cmd(server.overworld(), "execute in " + id + " run tp " + p.getName().getString() + " " + lp.x() + " " + lp.y() + " " + lp.z());
+            say(p, "PVP 중에는 다른 차원으로 이동할 수 없습니다.", ChatFormatting.RED);
+        } finally { returning.remove(p.getUUID()); }
+    }
+
+    // ---------- 해피 가스트: 탑승 중 속도 1.5배 ----------
+    static void restoreBoost(Boost b) {
+        if (b.e instanceof LivingEntity le) {
+            var fa = le.getAttribute(Attributes.FLYING_SPEED);
+            var ma = le.getAttribute(Attributes.MOVEMENT_SPEED);
+            if (fa != null && b.fly >= 0) fa.setBaseValue(b.fly);
+            if (ma != null && b.mov >= 0) ma.setBaseValue(b.mov);
+        }
+    }
+    static void restoreGhasts() {
+        for (Boost b : ghastBoost.values()) restoreBoost(b);
+        ghastBoost.clear();
+    }
+    static void tickGhasts(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            Entity v = p.getVehicle();
+            if (v instanceof LivingEntity le && typeId(v).equals("minecraft:happy_ghast") && !ghastBoost.containsKey(v.getUUID())) {
+                var fa = le.getAttribute(Attributes.FLYING_SPEED);
+                var ma = le.getAttribute(Attributes.MOVEMENT_SPEED);
+                Boost b = new Boost();
+                b.e = v;
+                if (fa != null) { b.fly = fa.getBaseValue(); fa.setBaseValue(b.fly * 1.5); }
+                if (ma != null) { b.mov = ma.getBaseValue(); ma.setBaseValue(b.mov * 1.5); }
+                ghastBoost.put(v.getUUID(), b);
+            }
+        }
+        for (Iterator<Map.Entry<UUID, Boost>> it = ghastBoost.entrySet().iterator(); it.hasNext(); ) {
+            Boost b = it.next().getValue();
+            boolean ridden = false;
+            if (!b.e.isRemoved()) for (Entity pa : b.e.getPassengers()) if (pa instanceof ServerPlayer) ridden = true;
+            if (!ridden) { restoreBoost(b); it.remove(); }
         }
     }
 }
