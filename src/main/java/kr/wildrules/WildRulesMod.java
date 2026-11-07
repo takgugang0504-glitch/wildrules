@@ -53,6 +53,9 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.entity.TamableAnimal;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.Vec3;
@@ -85,6 +88,7 @@ public class WildRulesMod implements ModInitializer {
         Map<String, Integer> placed = new HashMap<>();
         List<Rec> beacons = new ArrayList<>();
         Map<String, Long> bans = new HashMap<>();
+        boolean dragonKilled;
     }
     static class Pending { String dim; BlockPos pos; UUID uuid; String name; int age; }
 
@@ -102,6 +106,13 @@ public class WildRulesMod implements ModInitializer {
     static final Set<UUID> banNotified = new HashSet<>();
     record Rm(String dim, BlockPos pos) { }
     record Orb(ServerLevel level, double x, double y, double z, int value) { }
+    record ArrowTrack(Entity arrow, double x, double y, double z) { }
+    record Delayed(ServerLevel level, double x, double y, double z, int value, int due) { }
+    static final List<ArrowTrack> arrowTracks = new ArrayList<>();
+    static final List<Delayed> delayedOrbs = new ArrayList<>();
+    static final List<Entity> dragonQueue = new ArrayList<>();
+    static final Map<UUID, Boolean> zState = new HashMap<>();
+    static final Map<UUID, Long> totemMsg = new HashMap<>();
     static final Map<UUID, Long> dragonReady = new HashMap<>();
     static final Map<UUID, Long> dragonActive = new HashMap<>();
     static final Map<UUID, Entity> hookedMap = new HashMap<>();
@@ -248,7 +259,16 @@ public class WildRulesMod implements ModInitializer {
             if (tc.canPlace() && level instanceof ServerLevel tl) {
                 BlockPos tp = tc.getClickedPos();
                 if (!sp.getAbilities().instabuild) held.shrink(1);
-                tl.explode(sp, tp.getX() + 0.5, tp.getY() + 0.5, tp.getZ() + 0.5, 4.0F, Level.ExplosionInteraction.NONE);
+                Vec3 c = new Vec3(tp.getX() + 0.5, tp.getY() + 0.5, tp.getZ() + 0.5);
+                cmd(tl, "particle minecraft:explosion_emitter " + c.x + " " + c.y + " " + c.z + " 0 0 0 0 1 force");
+                cmd(tl, "playsound minecraft:entity.generic.explode block @a " + c.x + " " + c.y + " " + c.z + " 4 1");
+                for (LivingEntity le : tl.getEntitiesOfClass(LivingEntity.class, new AABB(c.x - 5, c.y - 5, c.z - 5, c.x + 5, c.y + 5, c.z + 5))) {
+                    double d = le.position().add(0, le.getBbHeight() / 2.0, 0).distanceTo(c);
+                    if (d > 5.0) continue;
+                    double dmg = (le == sp ? 10.0 : 5.0) * (1.0 - d / 5.0);        // 거리에 따라 감소
+                    if (dmg < 0.5) continue;
+                    cmd(tl, "damage " + le.getUUID() + " " + dmg + " minecraft:player_explosion by " + sp.getName().getString());
+                }
                 return InteractionResult.FAIL;
             }
         }
@@ -370,10 +390,34 @@ public class WildRulesMod implements ModInitializer {
         orbQueue.clear();
         for (Orb o : oq) cmd(o.level(), "summon minecraft:experience_orb " + o.x() + " " + o.y() + " " + o.z() + " {Value:" + o.value() + "s}");
         if (handledBottles.size() > 2000) handledBottles.clear();
-        if (s.getTickCount() % 5 == 0) safe(() -> tickCombat(s), "combat");
+        for (Entity de : new ArrayList<>(dragonQueue)) {               // 엔더 드래곤 체력 1000
+            if (de instanceof LivingEntity le) {
+                var at = le.getAttribute(Attributes.MAX_HEALTH);
+                if (at != null) at.setBaseValue(1000.0);
+                le.setHealth(1000.0F);
+            }
+        }
+        dragonQueue.clear();
+        for (Iterator<ArrowTrack> ai = arrowTracks.iterator(); ai.hasNext(); ) {   // 스켈레톤 머리 화살: 100칸 넘으면 사라짐
+            ArrowTrack at2 = ai.next();
+            Entity ar = at2.arrow();
+            if (ar.isRemoved()) { ai.remove(); continue; }
+            double dx = ar.getX() - at2.x(), dy = ar.getY() - at2.y(), dz = ar.getZ() - at2.z();
+            if (dx * dx + dy * dy + dz * dz > 10000.0) { ar.discard(); ai.remove(); }
+        }
+        for (Iterator<Delayed> di = delayedOrbs.iterator(); di.hasNext(); ) {      // 드래곤 재처치 경험치
+            Delayed d = di.next();
+            if (s.getTickCount() >= d.due()) {
+                cmd(d.level(), "summon minecraft:experience_orb " + d.x() + " " + d.y() + " " + d.z() + " {Value:" + d.value() + "s}");
+                di.remove();
+            }
+        }
+        if (s.getTickCount() % 5 == 0) { safe(() -> tickCombat(s), "combat"); safe(() -> tickTotems(s), "totems"); }
+        if (s.getTickCount() % 20 == 0) safe(() -> tickWolves(s), "wolves");
         if (s.getTickCount() % 2 == 0) {
             safe(() -> tickHeads(s), "heads");
             safe(() -> tickSmelt(s), "smelt");
+            safe(() -> tickZ(s), "zhead");
             for (ServerPlayer cp : s.getPlayerList().getPlayers()) {
                 try { for (var slot : cp.containerMenu.slots) clampMace(slot.getItem()); }
                 catch (Exception ex) { if (!patchWarned) { patchWarned = true; System.err.println("[wildrules] mace clamp failed: " + ex); } }
@@ -427,7 +471,7 @@ public class WildRulesMod implements ModInitializer {
             Set<UUID> prev = flagged.getOrDefault(key, new HashSet<>());
             Set<UUID> cur = new HashSet<>();
             for (ServerPlayer t : s.getPlayerList().getPlayers()) {
-                if (t.getUUID().equals(owner.getUUID()) || t.isSpectator()) continue;
+                if (t.getUUID().equals(owner.getUUID()) || t.isSpectator() || t.getItemBySlot(EquipmentSlot.HEAD).is(Items.ZOMBIE_HEAD)) continue;
                 if (!dimKey(t.level()).equals(r.dim)) continue;
                 if (t.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) > DETECT_RANGE * DETECT_RANGE) continue;
                 cur.add(t.getUUID());
@@ -574,6 +618,10 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
+        if (server != null && typeId(e).equals("minecraft:ender_dragon") && e.level() instanceof ServerLevel dl) {
+            if (data.dragonKilled) delayedOrbs.add(new Delayed(dl, e.getX(), e.getY() + 1.0, e.getZ(), 11500, server.getTickCount() + 210));   // 재처치도 12000 (바닐라 500 + 11500)
+            else { data.dragonKilled = true; save(); }
+        }
         if (server != null && e instanceof ServerPlayer dp) {
             String n = dp.getName().getString(), dm = dimKey(dp.level());
             int di = dm.contains("the_nether") ? 1 : dm.contains("the_end") ? 2 : 0;
@@ -597,6 +645,7 @@ public class WildRulesMod implements ModInitializer {
         else if (SKELETONS.contains(id)) { item = "skeleton_skull"; chance = 0.005; }
         else if (id.equals("minecraft:creeper")) { item = "creeper_head"; chance = 0.005; }
         else if (id.equals("minecraft:piglin") || id.equals("minecraft:piglin_brute")) { item = "piglin_head"; chance = 0.001; }
+        else if (id.equals("minecraft:wither_skeleton")) { item = "wither_skeleton_skull"; chance = 0.075; }   // 바닐라 확률과 합쳐 약 10%
         if (item == null || lvl.getRandom().nextDouble() >= chance) return;
         cmd(lvl, "summon minecraft:item " + e.getX() + " " + (e.getY() + 0.3) + " " + e.getZ()
                 + " {Item:{id:\"minecraft:" + item + "\",count:1}}");
@@ -805,8 +854,7 @@ public class WildRulesMod implements ModInitializer {
         }
         cmd(server.overworld(), "experience set " + nm + " 0 levels");
         cmd(server.overworld(), "experience set " + nm + " 0 points");
-        cmd(server.overworld(), "scoreboard players set " + nm + " wr_nograve 1");
-        cmd(server.overworld(), "kill " + nm);
+        cmd(server.overworld(), "scoreboard players set " + nm + " wr_logout 1");   // 재접속 시 데이터팩이 머리 없이 사망 처리
     }
 
     // ---------- 경험치 병: 병 하나 = 던진 사람의 다음 1레벨 분량 ----------
@@ -815,12 +863,15 @@ public class WildRulesMod implements ModInitializer {
         if ((id.equals("minecraft:arrow") || id.equals("minecraft:spectral_arrow")) && entity.tickCount == 0
                 && entity instanceof Projectile ap && ap.getOwner() instanceof ServerPlayer shooter
                 && shooter.getItemBySlot(EquipmentSlot.HEAD).is(Items.SKELETON_SKULL)
-                && shooter.getMainHandItem().is(Items.BOW)) {
+                && (shooter.getMainHandItem().is(Items.BOW) || shooter.getMainHandItem().is(Items.CROSSBOW))) {
             Vec3 v = entity.getDeltaMovement();
             double sp = v.length();
-            if (sp > 1.5) entity.setDeltaMovement(v.scale(3.15 / sp));        // 석궁과 같은 속도(거리)
+            if (sp > 0.1) entity.setDeltaMovement(v.scale(4.5 / sp));      // 일반 화살(3.0)보다 빠르게
+            entity.setNoGravity(true);                                      // 일자로 날아감
+            arrowTracks.add(new ArrowTrack(entity, entity.getX(), entity.getY(), entity.getZ()));
             return;
         }
+        if (id.equals("minecraft:ender_dragon") && entity.addTag("wr_dragon_mod")) { dragonQueue.add(entity); return; }
         if (id.equals("minecraft:experience_orb")) {
             for (Entity b : world.getEntitiesOfClass(Entity.class, entity.getBoundingBox().inflate(2.5))) {
                 if (!typeId(b).equals("minecraft:experience_bottle")) continue;
@@ -905,5 +956,55 @@ public class WildRulesMod implements ModInitializer {
         Vec3 n = d.scale(1.0 / dist);
         e.push(n.x * sp, Math.max(0.35, n.y * sp + 0.3), n.z * sp);
         if (e instanceof ServerPlayer tp) tp.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket(tp));
+    }
+
+    // ---------- 좀비 머리 착용 상태를 데이터팩(발광 면제)에 전달 ----------
+    static void tickZ(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            boolean w = p.getItemBySlot(EquipmentSlot.HEAD).is(Items.ZOMBIE_HEAD);
+            Boolean prev = zState.put(p.getUUID(), w);
+            if (prev == null || prev != w) cmd(s.overworld(), "scoreboard players set " + p.getName().getString() + " wr_zhead " + (w ? 1 : 0));
+        }
+    }
+
+    // ---------- 불사의 토템: 인벤토리(왼손 포함) 최대 3개, 초과분은 바닥에 (셜커 상자 안은 제외) ----------
+    static void tickTotems(MinecraftServer s) {
+        long now = System.currentTimeMillis();
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            Inventory inv = p.getInventory();
+            ItemStack off = p.getOffhandItem();
+            int count = off.is(Items.TOTEM_OF_UNDYING) ? off.getCount() : 0;
+            boolean dropped = false;
+            for (int i = 0; i < inv.getContainerSize(); i++) {
+                ItemStack st = inv.getItem(i);
+                if (st.isEmpty() || st == off || !st.is(Items.TOTEM_OF_UNDYING)) continue;
+                if (count + st.getCount() > 3) {
+                    ItemStack copy = st.copy();
+                    inv.setItem(i, ItemStack.EMPTY);
+                    var ie = p.drop(copy, true);
+                    if (ie != null) ie.setPickUpDelay(60);
+                    dropped = true;
+                } else count += st.getCount();
+            }
+            if (dropped) {
+                Long l = totemMsg.get(p.getUUID());
+                if (l == null || now - l > 2000) {
+                    totemMsg.put(p.getUUID(), now);
+                    say(p, "불사의 토템은 인벤토리(왼손 포함)에 최대 3개까지만 가질 수 있어 초과분을 바닥에 떨어뜨렸습니다. (셜커 상자 안은 제한 없음)", ChatFormatting.RED);
+                }
+            }
+        }
+    }
+
+    // ---------- 길들인 늑대 + 늑대 갑옷: 저항 I, 힘 II ----------
+    static void tickWolves(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            for (Mob m : p.level().getEntitiesOfClass(Mob.class, p.getBoundingBox().inflate(48.0))) {
+                if (!typeId(m).equals("minecraft:wolf") || !(m instanceof TamableAnimal ta) || !ta.isTame()) continue;
+                if (!m.getItemBySlot(EquipmentSlot.BODY).is(Items.WOLF_ARMOR)) continue;
+                m.addEffect(new MobEffectInstance(MobEffects.RESISTANCE, 100, 0, true, false, false));
+                m.addEffect(new MobEffectInstance(MobEffects.STRENGTH, 100, 1, true, false, false));
+            }
+        }
     }
 }
