@@ -11,7 +11,6 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerBlockEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
@@ -161,7 +160,6 @@ public class WildRulesMod implements ModInitializer {
         ServerLivingEntityEvents.AFTER_DEATH.register(WildRulesMod::afterDeath);
         PlayerBlockBreakEvents.BEFORE.register(WildRulesMod::beforeBreak);
         AttackEntityCallback.EVENT.register(WildRulesMod::onAttack);
-        ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, origin, destination) -> onChangeWorld(player));
         AttackBlockCallback.EVENT.register((pl, lvl, hand, pos, dir) -> {      // 신호기는 주인만 부술 수 있음 (채굴 시작 단계에서 차단)
             if (lvl.isClientSide() || !lvl.getBlockState(pos).is(Blocks.BEACON)) return InteractionResult.PASS;
             Rec r = find(dimKey(lvl), pos);
@@ -816,6 +814,8 @@ public class WildRulesMod implements ModInitializer {
                 pb.sendSystemMessage(Component.literal("PVP 활성화가 종료되었습니다").withStyle(ChatFormatting.GRAY), true);
                 continue;
             }
+            checkDim(pa);
+            checkDim(pb);
             lastPos.put(pa.getUUID(), new LastPos(dimKey(pa.level()), pa.getX(), pa.getY(), pa.getZ()));
             lastPos.put(pb.getUUID(), new LastPos(dimKey(pb.level()), pb.getX(), pb.getY(), pb.getZ()));
             if (zoneCheck(s, c, pa, pb, true, tick)) { combats.remove(c); continue; }
@@ -1001,8 +1001,11 @@ public class WildRulesMod implements ModInitializer {
                 if (count + st.getCount() > 3) {
                     ItemStack copy = st.copy();
                     inv.setItem(i, ItemStack.EMPTY);
-                    var ie = p.drop(copy, true);
-                    if (ie != null) ie.setPickUpDelay(60);
+                    if (p.level() instanceof ServerLevel pl) {
+                        net.minecraft.world.entity.item.ItemEntity ie = new net.minecraft.world.entity.item.ItemEntity(pl, p.getX(), p.getY() + 0.5, p.getZ(), copy);
+                        ie.setPickUpDelay(60);
+                        pl.addFreshEntity(ie);
+                    }
                     dropped = true;
                 } else count += st.getCount();
             }
@@ -1029,17 +1032,13 @@ public class WildRulesMod implements ModInitializer {
     }
 
     // ---------- 전투(PVP) 중 차원 이동 금지: 이동 직후 원래 위치로 되돌림 ----------
-    static void onChangeWorld(ServerPlayer p) {
-        if (server == null || returning.contains(p.getUUID()) || !inCombat(p.getUUID())) return;
+    static void checkDim(ServerPlayer p) {
         LastPos lp = lastPos.get(p.getUUID());
-        if (lp == null) return;
-        returning.add(p.getUUID());
-        try {
-            String d = lp.dim();
-            String id = d.substring(d.lastIndexOf("/ ") + 2, d.length() - 1);
-            cmd(server.overworld(), "execute in " + id + " run tp " + p.getName().getString() + " " + lp.x() + " " + lp.y() + " " + lp.z());
-            say(p, "PVP 중에는 다른 차원으로 이동할 수 없습니다.", ChatFormatting.RED);
-        } finally { returning.remove(p.getUUID()); }
+        if (lp == null || lp.dim().equals(dimKey(p.level()))) return;
+        String d = lp.dim();
+        String id = d.substring(d.lastIndexOf("/ ") + 2, d.length() - 1);
+        cmd(server.overworld(), "execute in " + id + " run tp " + p.getName().getString() + " " + lp.x() + " " + lp.y() + " " + lp.z());
+        say(p, "PVP 중에는 다른 차원으로 이동할 수 없습니다.", ChatFormatting.RED);
     }
 
     // ---------- 해피 가스트: 탑승 중 속도 1.5배 ----------
