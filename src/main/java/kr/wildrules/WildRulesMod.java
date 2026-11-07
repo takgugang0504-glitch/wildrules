@@ -48,6 +48,7 @@ import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
@@ -981,8 +982,10 @@ public class WildRulesMod implements ModInitializer {
                 if (count + st.getCount() > 3) {
                     ItemStack copy = st.copy();
                     inv.setItem(i, ItemStack.EMPTY);
-                    var ie = p.drop(copy, true);
-                    if (ie != null) ie.setPickUpDelay(60);
+                    ItemEntity ie = new ItemEntity(p.level(), p.getX(), p.getEyeY() - 0.3, p.getZ(), copy);
+                    ie.setDeltaMovement(p.getLookAngle().scale(0.25));
+                    ie.setPickUpDelay(60);
+                    p.level().addFreshEntity(ie);
                     dropped = true;
                 } else count += st.getCount();
             }
