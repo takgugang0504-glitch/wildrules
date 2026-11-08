@@ -1108,7 +1108,8 @@ public class WildRulesMod implements ModInitializer {
             ItemStack right = am.getSlot(1).getItem();
             int uses = repairPenalty(left) <= 0 ? 0 : 31 - Integer.numberOfLeadingZeros(repairPenalty(left) + 1);
             int base = Math.max(1, vanilla - repairPenalty(left) - repairPenalty(right));
-            int fixed = Math.max(base, 20 + 5 * uses);
+            int fixed = 20 + 5 * uses;                                            // 인챈트 종류와 상관없이 사용 횟수만으로 20, 25, 30...
+            if (!am.getSlot(1).hasItem()) fixed = 1;                              // 이름만 바꿀 때(재료 없음)는 1레벨
             try {
                 if (anvilCostField == null) { anvilCostField = AnvilMenu.class.getDeclaredField("cost"); anvilCostField.setAccessible(true); }
                 ((net.minecraft.world.inventory.DataSlot) anvilCostField.get(am)).set(fixed);
