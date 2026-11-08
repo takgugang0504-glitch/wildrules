@@ -55,6 +55,7 @@ import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.entity.TamableAnimal;
+import net.minecraft.world.inventory.AnvilMenu;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
@@ -74,7 +75,9 @@ import java.util.*;
 public class WildRulesMod implements ModInitializer {
     // ---- 설정값 ----
     static final int MAX_BEACONS = 3;            // 한 사람당 설치 가능 횟수
-    static final double DETECT_RANGE = 100.0;     // 감지 범위(칸)
+    static final double DETECT_RANGE = 100.0;       // 플레이어 발광/알림 범위
+    static final double SPAWN_BLOCK_R = 200.0;      // 몬스터 생성 금지: 가로 반경
+    static final double SPAWN_BLOCK_H = 100.0;      // 몬스터 생성 금지: 높이     // 감지 범위(칸)
     static final int MIN_STREAK = 2;              // 이 연속킬 이상이면 감지 대상
     static final double BUFF_RANGE = 50.0;        // 주인 버프 범위(칸)
     static final String STREAK_OBJECTIVE = "wr_streak"; // 데이터팩의 연속킬 점수판
@@ -433,6 +436,7 @@ public class WildRulesMod implements ModInitializer {
         if (s.getTickCount() % 2 == 0) {
             safe(() -> tickHeads(s), "heads");
             safe(() -> tickSmelt(s), "smelt");
+            safe(() -> tickAnvil(s), "anvil");
             safe(() -> tickZ(s), "zhead");
             for (ServerPlayer cp : s.getPlayerList().getPlayers()) {
                 try { for (var slot : cp.containerMenu.slots) clampMace(slot.getItem()); }
@@ -912,7 +916,8 @@ public class WildRulesMod implements ModInitializer {
         if (id.equals("minecraft:wither") || id.equals("minecraft:ender_dragon")) return;
         String dim = dimKey(world);
         for (Rec r : data.beacons) {
-            if (r.dim.equals(dim) && entity.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) <= DETECT_RANGE * DETECT_RANGE) {
+            if (r.dim.equals(dim) && Math.hypot(entity.getX() - (r.x + 0.5), entity.getZ() - (r.z + 0.5)) <= SPAWN_BLOCK_R
+                    && Math.abs(entity.getY() - (r.y + 0.5)) <= SPAWN_BLOCK_H) {
                 discardQueue.add(entity);
                 return;
             }
@@ -1072,6 +1077,45 @@ public class WildRulesMod implements ModInitializer {
             boolean ridden = false;
             if (!b.e.isRemoved()) for (Entity pa : b.e.getPassengers()) if (pa instanceof ServerPlayer) ridden = true;
             if (!ridden) { restoreBoost(b); it.remove(); }
+        }
+    }
+
+    // ---------- 모루: "너무 비쌉니다"(40레벨) 해제 + 비용 20, 25, 30 ... ----------
+    // 방법: 결과가 비어 있고 비용이 40 이상이면, 아주 짧은 순간만 '제한 없는 재료' 상태로 결과를 다시 계산시킨다.
+    static java.lang.reflect.Field anvilCostField;
+    static final Map<UUID, Integer> anvilFixed = new HashMap<>();
+    static int repairPenalty(ItemStack st) {
+        Integer rc = st.get(DataComponents.REPAIR_COST);
+        return rc == null ? 0 : rc;
+    }
+    static void tickAnvil(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            if (!(p.containerMenu instanceof AnvilMenu am)) { anvilFixed.remove(p.getUUID()); continue; }
+            ItemStack left = am.getSlot(0).getItem();
+            if (left.isEmpty()) continue;
+            boolean capped = !am.getSlot(2).hasItem() && am.getCost() >= 40 && !p.getAbilities().instabuild;
+            if (capped) {
+                boolean old = p.getAbilities().instabuild;
+                p.getAbilities().instabuild = true;
+                try { am.slotsChanged(am.getSlot(0).container); }
+                finally { p.getAbilities().instabuild = old; }
+                anvilFixed.remove(p.getUUID());
+            }
+            if (!am.getSlot(2).hasItem()) continue;
+            int vanilla = am.getCost();
+            Integer last = anvilFixed.get(p.getUUID());
+            if (last != null && last == vanilla) continue;                      // 이미 우리가 정한 비용
+            ItemStack right = am.getSlot(1).getItem();
+            int uses = repairPenalty(left) <= 0 ? 0 : 31 - Integer.numberOfLeadingZeros(repairPenalty(left) + 1);
+            int base = Math.max(1, vanilla - repairPenalty(left) - repairPenalty(right));
+            int fixed = Math.max(base, 20 + 5 * uses);
+            try {
+                if (anvilCostField == null) { anvilCostField = AnvilMenu.class.getDeclaredField("cost"); anvilCostField.setAccessible(true); }
+                ((net.minecraft.world.inventory.DataSlot) anvilCostField.get(am)).set(fixed);
+                anvilFixed.put(p.getUUID(), fixed);
+            } catch (Exception ex) {
+                if (!warnedTasks.contains("anvilcost")) { warnedTasks.add("anvilcost"); System.err.println("[wildrules] anvil cost field: " + ex); }
+            }
         }
     }
 }
