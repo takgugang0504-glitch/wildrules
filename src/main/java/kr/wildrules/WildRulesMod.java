@@ -24,6 +24,7 @@ import net.minecraft.core.component.DataComponentType;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.item.enchantment.Enchantment;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.item.enchantment.Enchantments;
@@ -54,6 +55,7 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.entity.ExperienceOrb;
 import net.minecraft.world.entity.TamableAnimal;
 import net.minecraft.world.inventory.AnvilMenu;
 import net.minecraft.world.entity.ai.attributes.Attributes;
@@ -83,6 +85,7 @@ public class WildRulesMod implements ModInitializer {
     static final String STREAK_OBJECTIVE = "wr_streak"; // 데이터팩의 연속킬 점수판
 
     // ---- 저장 데이터 ----
+    static class Juke { String dim; int x, y, z; String owner; }
     static class Rec {
         String dim; int x, y, z; String owner; String ownerName;
         String effect;
@@ -93,6 +96,7 @@ public class WildRulesMod implements ModInitializer {
         List<Rec> beacons = new ArrayList<>();
         Map<String, Long> bans = new HashMap<>();
         boolean dragonKilled;
+        List<Juke> jukes = new ArrayList<>();
     }
     static class Pending { String dim; BlockPos pos; UUID uuid; String name; int age; }
 
@@ -120,6 +124,24 @@ public class WildRulesMod implements ModInitializer {
     static final List<ArrowTrack> arrowTracks = new ArrayList<>();
     static final List<Delayed> delayedOrbs = new ArrayList<>();
     static final List<Entity> dragonQueue = new ArrayList<>();
+    // 접속하는 모든 플레이어에게 음반 리소스팩을 자동으로 보냄 (플레이어가 따로 설치할 필요 없음)
+    static final String PACK_URL = "https://raw.githubusercontent.com/takgugang0504-glitch/wildrulesresospack/main/wild_rules_resourcepack.zip";
+    static final String PACK_SHA1 = "6fb0494ce35a815acb8305ada902c1004d65c089";
+    static final UUID PACK_ID = UUID.nameUUIDFromBytes("wildrules-resourcepack".getBytes());
+    static final String DISC_NAME = "Alia - 숨바꼭질 cover by 유즈하 리코";
+    static class TInfo { Entity e; UUID owner; int impaling, loyalty, channeling; boolean hit, bolt; }
+    static final Map<UUID, TInfo> tridents = new HashMap<>();
+    record Extra(LivingEntity victim, float amount, String attacker, float hp) { }
+    static final List<Extra> extras = new ArrayList<>();
+    static final Set<UUID> creeperTaint = new HashSet<>();
+    static final List<Pending> jukePending = new ArrayList<>();
+    static final Map<UUID, Integer> headState = new HashMap<>();
+    static final Map<UUID, Integer> foodLast = new HashMap<>();
+    static final Map<UUID, Float> satLast = new HashMap<>();
+    static final Map<UUID, Integer> glowAt = new HashMap<>();
+    static int dTrackUntil = -1, dSum;
+    static double dX, dY, dZ;
+    static ServerLevel dLevel;
     static final Map<UUID, Boolean> zState = new HashMap<>();
     static final Map<UUID, Long> totemMsg = new HashMap<>();
     static final Map<UUID, Long> dragonReady = new HashMap<>();
@@ -148,7 +170,8 @@ public class WildRulesMod implements ModInitializer {
         String[][] a = {{"sharpness","15"},{"smite","10"},{"protection","10"},{"fire_protection","10"},
             {"blast_protection","10"},{"projectile_protection","10"},{"unbreaking","5"},{"fire_aspect","5"},
             {"knockback","10"},{"thorns","5"},{"depth_strider","5"},{"feather_falling","8"},{"fortune","5"},
-            {"efficiency","10"},{"looting","5"},{"power","10"},{"punch","4"},{"sweeping_edge","5"}};
+            {"efficiency","10"},{"looting","5"},{"power","10"},{"punch","4"},{"sweeping_edge","5"},
+            {"mending","5"},{"impaling","10"},{"loyalty","1"}};
         for (String[] e : a) MAX_LEVELS.put("enchantment.minecraft." + e[0], Integer.parseInt(e[1]));
     }
 
@@ -173,6 +196,14 @@ public class WildRulesMod implements ModInitializer {
             return InteractionResult.PASS;
         });
         ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> onEntityLoad(entity, world));
+        ServerEntityEvents.ENTITY_UNLOAD.register((entity, world) -> onEntityUnload(entity, world));
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, srv) -> {
+            try {
+                handler.send(new net.minecraft.network.protocol.common.ClientboundResourcePackPushPacket(
+                    PACK_ID, PACK_URL, PACK_SHA1, false,
+                    java.util.Optional.of(Component.literal("야생 규칙: 음반 소리를 듣기 위한 리소스팩입니다."))));
+            } catch (Exception ex) { System.err.println("[wildrules] resource pack push failed: " + ex); }
+        });
         ServerPlayConnectionEvents.DISCONNECT.register((handler, srv) -> {
             if (!srv.isRunning()) return;
             try { onDisconnect(handler.getPlayer()); } catch (Exception ex) { System.err.println("[wildrules] disconnect: " + ex); }
@@ -189,6 +220,7 @@ public class WildRulesMod implements ModInitializer {
                 Data d = GSON.fromJson(Files.readString(file), Data.class);
                 if (d != null) data = d;
                 if (data.bans == null) data.bans = new HashMap<>();
+                if (data.jukes == null) data.jukes = new ArrayList<>();
             }
         } catch (Exception e) { System.err.println("[wildrules] load failed: " + e); }
     }
@@ -266,6 +298,11 @@ public class WildRulesMod implements ModInitializer {
         BlockPos pos = hit.getBlockPos();
         ItemStack held = player.getItemInHand(hand);
 
+        if (level.getBlockState(pos).is(Blocks.JUKEBOX) && isOurDisc(held)) {
+            Pending jp = new Pending();
+            jp.dim = dimKey(level); jp.pos = pos.immutable(); jp.uuid = sp.getUUID(); jp.name = "";
+            jukePending.add(jp);
+        }
         if (level.getBlockState(pos).is(Blocks.ENDER_CHEST)) {
             removeQueue.add(new Rm(dimKey(level), pos.immutable()));
             say(sp, "엔더 상자는 이 서버에서 사용할 수 없습니다.", ChatFormatting.RED);
@@ -433,7 +470,21 @@ public class WildRulesMod implements ModInitializer {
         if (s.getTickCount() % 5 == 0) { safe(() -> tickCombat(s), "combat"); safe(() -> tickTotems(s), "totems"); }
         if (s.getTickCount() % 20 == 0) safe(() -> tickWolves(s), "wolves");
         if (s.getTickCount() % 10 == 0) safe(() -> tickGhasts(s), "ghasts");
+        safe(() -> tickTridents(s), "tridents");
+        if (!extras.isEmpty()) {
+            for (Extra x : new ArrayList<>(extras)) {                      // 삼지창 찌르기 추가 피해
+                LivingEntity v = x.victim();
+                if (v.isAlive() && v.getHealth() < x.hp()) {
+                    float nh = v.getHealth() - x.amount();
+                    if (nh <= 0) cmd(s.overworld(), "damage " + v.getUUID() + " 1000 minecraft:player_attack by " + x.attacker());
+                    else v.setHealth(nh);
+                }
+            }
+            extras.clear();
+        }
+        if (s.getTickCount() % 20 == 0) { safe(() -> tickJukes(s), "jukes"); safe(() -> tickDragonXp(s), "dragonxp"); }
         if (s.getTickCount() % 2 == 0) {
+            safe(() -> tickBuffs(s), "buffs");
             safe(() -> tickHeads(s), "heads");
             safe(() -> tickSmelt(s), "smelt");
             safe(() -> tickAnvil(s), "anvil");
@@ -495,6 +546,7 @@ public class WildRulesMod implements ModInitializer {
                 if (!dimKey(t.level()).equals(r.dim)) continue;
                 if (t.distanceToSqr(r.x + 0.5, r.y + 0.5, r.z + 0.5) > DETECT_RANGE * DETECT_RANGE) continue;
                 cur.add(t.getUUID());
+                glowAt.put(t.getUUID(), s.getTickCount());
                 t.addEffect(new MobEffectInstance(MobEffects.GLOWING, 40, 0, true, false, false));
                 if (!prev.contains(t.getUUID())) {
                     boolean big = streak(s, t) >= 5;
@@ -530,6 +582,27 @@ public class WildRulesMod implements ModInitializer {
     }
     static String fmt(long ms) { long m = ms / 60000L; return (m / 60) + "시간 " + (m % 60) + "분"; }
     static boolean allowDamage(LivingEntity victim, DamageSource source, float amount) {
+        if (server != null) {
+            if (typeId(victim).equals("minecraft:creeper")) {
+                boolean bare = source.getEntity() instanceof ServerPlayer cp && source.getDirectEntity() == source.getEntity() && cp.getMainHandItem().isEmpty();
+                if (!bare) creeperTaint.add(victim.getUUID());
+            }
+            Entity de = source.getDirectEntity();
+            Entity atk = source.getEntity();
+            TInfo ti = de == null ? null : tridents.get(de.getUUID());
+            int imp = 0, cha = 0;
+            if (ti != null) { imp = ti.impaling; cha = ti.channeling; ti.hit = true; }
+            else if (atk instanceof ServerPlayer ap2 && de == atk && ap2.getMainHandItem().is(Items.TRIDENT))
+                imp = enchLevel(ap2.getMainHandItem(), Enchantments.IMPALING);
+            if (imp > 0 && atk instanceof ServerPlayer) {
+                float b = impalingBonus(imp, victim);
+                if (b > 0) extras.add(new Extra(victim, b, atk.getName().getString(), victim.getHealth()));
+            }
+            if (ti != null && cha > 0 && !ti.bolt && victim.level() instanceof ServerLevel vl && !vl.isThundering()) {
+                ti.bolt = true;                                              // 집전: 날씨와 상관없이 벼락
+                cmd(vl, "summon minecraft:lightning_bolt " + victim.getX() + " " + victim.getY() + " " + victim.getZ());
+            }
+        }
         if (server != null && victim instanceof ServerPlayer bp && bp.isBlocking()) fixStack(server, bp, bp.getUseItem());   // 막기 직전에 방패 규칙 보장
         if (server != null && victim instanceof ServerPlayer vp && vp.isBlocking()
                 && source.getDirectEntity() == source.getEntity() && source.getEntity() instanceof LivingEntity axeman) {
@@ -586,18 +659,22 @@ public class WildRulesMod implements ModInitializer {
     }
     static final Set<String> ZOMBIES = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombie_villager");
     static final Set<String> SKELETONS = Set.of("minecraft:skeleton", "minecraft:stray", "minecraft:bogged", "minecraft:parched");
-    static final Set<String> PIGLIN_IGNORE = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:stray", "minecraft:skeleton", "minecraft:parched",
-        "minecraft:creeper", "minecraft:spider", "minecraft:piglin", "minecraft:piglin_brute", "minecraft:hoglin", "minecraft:wither_skeleton",
-        "minecraft:magma_cube", "minecraft:blaze", "minecraft:slime");
+    static final Set<String> PIGLIN_IGNORE = Set.of("minecraft:wither_skeleton", "minecraft:blaze", "minecraft:skeleton", "minecraft:zombie",
+        "minecraft:parched", "minecraft:husk", "minecraft:stray", "minecraft:piglin", "minecraft:piglin_brute", "minecraft:zombified_piglin",
+        "minecraft:ghast", "minecraft:bogged", "minecraft:magma_cube", "minecraft:slime", "minecraft:creeper", "minecraft:spider",
+        "minecraft:witch", "minecraft:drowned", "minecraft:cave_spider", "minecraft:breeze", "minecraft:zombie_villager");
     static final Set<String> UNDEAD = Set.of("minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombie_villager",
         "minecraft:zombified_piglin", "minecraft:skeleton", "minecraft:stray", "minecraft:bogged", "minecraft:wither_skeleton",
         "minecraft:wither", "minecraft:zoglin", "minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:phantom");
+    static final Set<String> CREEPER_IGNORE = Set.of("minecraft:creeper", "minecraft:spider", "minecraft:cave_spider", "minecraft:witch");
+    static final Set<String> WITHER_IGNORE = Set.of("minecraft:wither_skeleton", "minecraft:blaze", "minecraft:skeleton", "minecraft:stray",
+        "minecraft:bogged", "minecraft:parched", "minecraft:piglin", "minecraft:piglin_brute", "minecraft:magma_cube", "minecraft:ghast");
     static boolean ignores(ItemStack head, Mob m) {
         String id = typeId(m);
         if (head.is(Items.ZOMBIE_HEAD)) return ZOMBIES.contains(id);
         if (head.is(Items.SKELETON_SKULL)) return SKELETONS.contains(id);
-        if (head.is(Items.CREEPER_HEAD)) return id.equals("minecraft:creeper");
-        if (head.is(Items.WITHER_SKELETON_SKULL)) return id.equals("minecraft:wither_skeleton");
+        if (head.is(Items.CREEPER_HEAD)) return CREEPER_IGNORE.contains(id);
+        if (head.is(Items.WITHER_SKELETON_SKULL)) return WITHER_IGNORE.contains(id);
         if (head.is(Items.PIGLIN_HEAD)) return PIGLIN_IGNORE.contains(id);
         return false;
     }
@@ -638,9 +715,17 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
-        if (server != null && typeId(e).equals("minecraft:ender_dragon") && e.level() instanceof ServerLevel dl) {
-            if (data.dragonKilled) delayedOrbs.add(new Delayed(dl, e.getX(), e.getY() + 1.0, e.getZ(), 11500, server.getTickCount() + 210));   // 재처치도 12000 (바닐라 500 + 11500)
-            else { data.dragonKilled = true; save(); }
+        if (server != null && typeId(e).equals("minecraft:ender_dragon") && e.level() instanceof ServerLevel dl) startDragonTrack(dl, e);
+        if (server != null && typeId(e).equals("minecraft:creeper")) {            // 맨손으로만 잡은 크리퍼: 음반 + 도전과제
+            boolean bare = src.getEntity() instanceof ServerPlayer kp && src.getDirectEntity() == src.getEntity()
+                    && kp.getMainHandItem().isEmpty() && !creeperTaint.contains(e.getUUID());
+            creeperTaint.remove(e.getUUID());
+            if (bare && e.level() instanceof ServerLevel cl) {
+                ItemStack disc = new ItemStack(Items.MUSIC_DISC_PRECIPICE);
+                disc.set(DataComponents.CUSTOM_NAME, Component.literal(DISC_NAME).withStyle(ChatFormatting.AQUA));
+                cl.addFreshEntity(new net.minecraft.world.entity.item.ItemEntity(cl, e.getX(), e.getY() + 0.5, e.getZ(), disc));
+                cmd(server.overworld(), "advancement grant " + ((ServerPlayer) src.getEntity()).getName().getString() + " only wr:creeper_veteran");
+            }
         }
         if (server != null && e instanceof ServerPlayer dp) {
             String n = dp.getName().getString(), dm = dimKey(dp.level());
@@ -665,7 +750,10 @@ public class WildRulesMod implements ModInitializer {
         else if (SKELETONS.contains(id)) { item = "skeleton_skull"; chance = 0.005; }
         else if (id.equals("minecraft:creeper")) { item = "creeper_head"; chance = 0.005; }
         else if (id.equals("minecraft:piglin") || id.equals("minecraft:piglin_brute")) { item = "piglin_head"; chance = 0.001; }
-        else if (id.equals("minecraft:wither_skeleton")) { item = "wither_skeleton_skull"; chance = 0.075; }   // 바닐라 확률과 합쳐 약 10%
+        else if (id.equals("minecraft:wither_skeleton") && ((ServerPlayer) src.getEntity()).getItemBySlot(EquipmentSlot.HEAD).is(Items.WITHER_SKELETON_SKULL)) {
+            item = "wither_skeleton_skull";                      // 위더 해골 머리를 쓰고 잡으면 약 10% (+약탈 레벨당 2.5%)
+            chance = 0.075 + 0.025 * enchLevel(((ServerPlayer) src.getEntity()).getMainHandItem(), Enchantments.LOOTING);
+        }
         if (item == null || lvl.getRandom().nextDouble() >= chance) return;
         cmd(lvl, "summon minecraft:item " + e.getX() + " " + (e.getY() + 0.3) + " " + e.getZ()
                 + " {Item:{id:\"minecraft:" + item + "\",count:1}}");
@@ -882,8 +970,25 @@ public class WildRulesMod implements ModInitializer {
     }
 
     // ---------- 경험치 병: 병 하나 = 던진 사람의 다음 1레벨 분량 ----------
+    static final Map<UUID, int[]> holdEnch = new HashMap<>();
     static void onEntityLoad(Entity entity, ServerLevel world) {
         String id = typeId(entity);
+        if (dTrackUntil >= 0 && world == dLevel && entity instanceof ExperienceOrb eo2 && entity.distanceToSqr(dX, dY, dZ) < 25600.0) dSum += eo2.getValue();
+        if ((id.equals("minecraft:ender_pearl") || id.equals("minecraft:snowball")) && entity.tickCount == 0
+                && entity instanceof Projectile pp && pp.getOwner() instanceof ServerPlayer th
+                && th.getItemBySlot(EquipmentSlot.HEAD).is(Items.SKELETON_SKULL)) {          // 스켈레톤 머리: 진주/눈덩이도 일자로
+            entity.setNoGravity(true);
+            arrowTracks.add(new ArrowTrack(entity, entity.getX(), entity.getY(), entity.getZ()));
+            return;
+        }
+        if (id.equals("minecraft:trident") && entity instanceof Projectile tp2 && tp2.getOwner() instanceof ServerPlayer to) {
+            TInfo ti = new TInfo();
+            ti.e = entity; ti.owner = to.getUUID();
+            int[] he = holdEnch.get(to.getUUID());
+            if (he != null) { ti.impaling = he[0]; ti.loyalty = he[1]; ti.channeling = he[2]; }
+            tridents.put(entity.getUUID(), ti);
+            return;
+        }
         if ((id.equals("minecraft:arrow") || id.equals("minecraft:spectral_arrow")) && entity.tickCount == 0
                 && entity instanceof Projectile ap && ap.getOwner() instanceof ServerPlayer shooter
                 && shooter.getItemBySlot(EquipmentSlot.HEAD).is(Items.SKELETON_SKULL)
@@ -1108,7 +1213,7 @@ public class WildRulesMod implements ModInitializer {
             ItemStack right = am.getSlot(1).getItem();
             int uses = repairPenalty(left) <= 0 ? 0 : 31 - Integer.numberOfLeadingZeros(repairPenalty(left) + 1);
             int base = Math.max(1, vanilla - repairPenalty(left) - repairPenalty(right));
-            int fixed = 20 + 5 * uses;                                            // 인챈트 종류와 상관없이 사용 횟수만으로 20, 25, 30...
+            int fixed = uses <= 0 ? 10 : 20 + 5 * (uses - 1);                                            // 인챈트 종류와 상관없이 사용 횟수만으로 20, 25, 30...
             if (!am.getSlot(1).hasItem()) fixed = 1;                              // 이름만 바꿀 때(재료 없음)는 1레벨
             try {
                 if (anvilCostField == null) { anvilCostField = AnvilMenu.class.getDeclaredField("cost"); anvilCostField.setAccessible(true); }
@@ -1117,6 +1222,147 @@ public class WildRulesMod implements ModInitializer {
             } catch (Exception ex) {
                 if (!warnedTasks.contains("anvilcost")) { warnedTasks.add("anvilcost"); System.err.println("[wildrules] anvil cost field: " + ex); }
             }
+        }
+    }
+
+    // ---------- 공통: 인챈트 레벨 읽기 ----------
+    static int enchLevel(ItemStack st, ResourceKey<Enchantment> key) {
+        if (st == null || st.isEmpty()) return 0;
+        ItemEnchantments en = st.get(DataComponents.ENCHANTMENTS);
+        if (en == null) return 0;
+        for (Holder<Enchantment> h : en.keySet()) if (h.is(key)) return en.getLevel(h);
+        return 0;
+    }
+
+    // ---------- 수선: 2~5레벨은 경험치의 25/50/75/100%를 추가 경험치로 ----------
+    static void onEntityUnload(Entity e, ServerLevel w) {
+        if (!(e instanceof ExperienceOrb eo) || !e.isRemoved()) return;
+        ServerPlayer near = null;
+        double best = 4.0;
+        for (ServerPlayer p : w.players()) {
+            double d = p.distanceToSqr(e);
+            if (d < best) { best = d; near = p; }
+        }
+        if (near == null) return;
+        int lvl = 0;
+        for (EquipmentSlot es : new EquipmentSlot[]{EquipmentSlot.MAINHAND, EquipmentSlot.OFFHAND, EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET})
+            lvl = Math.max(lvl, enchLevel(near.getItemBySlot(es), Enchantments.MENDING));
+        if (lvl >= 2) near.giveExperiencePoints((int) Math.round(eo.getValue() * (lvl - 1) * 0.25));
+    }
+
+    // ---------- 삼지창 ----------
+    static float impalingBonus(int lvl, LivingEntity v) {
+        float[] table = {1f, 1f, 1f, 1.5f, 2f, 2f, 2f, 2.5f, 3f, 3.5f};      // 레벨별 누적 추가 피해
+        int i = Math.max(1, Math.min(10, lvl)) - 1;
+        MobCategory c = v.getType().getCategory();
+        boolean aquatic = c == MobCategory.WATER_CREATURE || c == MobCategory.WATER_AMBIENT || c == MobCategory.UNDERGROUND_WATER_CREATURE;
+        if (lvl == 1 && !aquatic) return 0f;                                  // 1레벨은 수중 몹만, 2레벨부터 모든 엔티티
+        return table[i];
+    }
+    static void tickTridents(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            ItemStack st = p.getMainHandItem().is(Items.TRIDENT) ? p.getMainHandItem() : (p.getOffhandItem().is(Items.TRIDENT) ? p.getOffhandItem() : null);
+            if (st != null) holdEnch.put(p.getUUID(), new int[]{enchLevel(st, Enchantments.IMPALING), enchLevel(st, Enchantments.LOYALTY), enchLevel(st, Enchantments.CHANNELING)});
+        }
+        for (Iterator<Map.Entry<UUID, TInfo>> it = tridents.entrySet().iterator(); it.hasNext(); ) {
+            TInfo ti = it.next().getValue();
+            if (ti.e.isRemoved()) { it.remove(); continue; }
+            if (ti.loyalty >= 1) {                                            // 충성: 맞거나 박히면 즉시 주인에게 돌아옴
+                ServerPlayer o = s.getPlayerList().getPlayer(ti.owner);
+                if (o != null && (ti.hit || (ti.e.tickCount > 5 && ti.e.getDeltaMovement().lengthSqr() < 0.0004)))
+                    ti.e.setPos(o.getX(), o.getY() + 0.5, o.getZ());
+            }
+        }
+    }
+
+    // ---------- 머리 착용 버프 (방어도, 야간투시, 저항, 배고픔 잠금, 발광 면제) ----------
+    static void tickBuffs(MinecraftServer s) {
+        int tick = s.getTickCount();
+        ServerLevel o = s.overworld();
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            ItemStack h = p.getItemBySlot(EquipmentSlot.HEAD);
+            int st = h.is(Items.DRAGON_HEAD) ? 2 : (h.is(Items.ZOMBIE_HEAD) ? 1 : 0);
+            String n = p.getName().getString();
+            Integer prev = headState.put(p.getUUID(), st);
+            if (prev == null || prev != st) {
+                cmd(o, "attribute " + n + " minecraft:armor modifier remove wr:head_armor");
+                if (st == 2) cmd(o, "attribute " + n + " minecraft:armor modifier add wr:head_armor 4 add_value");    // 방어도 2칸
+                if (st == 1) cmd(o, "attribute " + n + " minecraft:armor modifier add wr:head_armor 2 add_value");    // 방어도 1칸
+            }
+            if (st == 2 && tick % 20 == 0) {
+                p.addEffect(new MobEffectInstance(MobEffects.NIGHT_VISION, 400, 0, true, false, false));
+                p.addEffect(new MobEffectInstance(MobEffects.RESISTANCE, 100, 0, true, false, false));
+            }
+            if (st == 1) {                                                    // 좀비 머리: 배고픔/포만감이 줄지 않음
+                var fd = p.getFoodData();
+                int f = fd.getFoodLevel();
+                float sat = fd.getSaturationLevel();
+                Integer lf = foodLast.get(p.getUUID());
+                Float ls = satLast.get(p.getUUID());
+                if (lf != null && f < lf) { fd.setFoodLevel(lf); f = lf; }
+                if (ls != null && sat < ls) { fd.setSaturation(ls); sat = ls; }
+                foodLast.put(p.getUUID(), f);
+                satLast.put(p.getUUID(), sat);
+            } else { foodLast.remove(p.getUUID()); satLast.remove(p.getUUID()); }
+            if (h.is(Items.CREEPER_HEAD) && p.hasEffect(MobEffects.GLOWING)) {  // 크리퍼 머리: 신호기/연속킬 발광 외에는 발광 면제
+                Integer g = glowAt.get(p.getUUID());
+                boolean beacon = g != null && tick - g < 30;
+                if (!beacon && streak(s, p) < 5) p.removeEffect(MobEffects.GLOWING);
+            }
+        }
+    }
+
+    // ---------- 음반: 주크박스에 꽂혀 있는 동안 주인에게 투명화 ----------
+    static boolean isOurDisc(ItemStack st) {
+        if (!st.is(Items.MUSIC_DISC_PRECIPICE)) return false;
+        var n = st.get(DataComponents.CUSTOM_NAME);
+        return n != null && n.getString().contains("숨바꼭질");
+    }
+    static void tickJukes(MinecraftServer s) {
+        for (Iterator<Pending> it = jukePending.iterator(); it.hasNext(); ) {
+            Pending jp = it.next();
+            jp.age++;
+            ServerLevel l = levelOf(s, jp.dim);
+            if (l != null && l.getBlockState(jp.pos).is(Blocks.JUKEBOX)
+                    && l.getBlockState(jp.pos).getValue(net.minecraft.world.level.block.JukeboxBlock.HAS_RECORD)) {
+                Juke j = new Juke();
+                j.dim = jp.dim; j.x = jp.pos.getX(); j.y = jp.pos.getY(); j.z = jp.pos.getZ(); j.owner = jp.uuid.toString();
+                data.jukes.add(j);
+                save();
+                it.remove();
+            } else if (jp.age > 3) it.remove();
+        }
+        for (Juke j : new ArrayList<>(data.jukes)) {
+            ServerLevel l = levelOf(s, j.dim);
+            BlockPos bp = new BlockPos(j.x, j.y, j.z);
+            if (l != null && l.hasChunkAt(bp)) {
+                var st = l.getBlockState(bp);
+                if (!st.is(Blocks.JUKEBOX) || !st.getValue(net.minecraft.world.level.block.JukeboxBlock.HAS_RECORD)) { data.jukes.remove(j); save(); continue; }
+            }
+            ServerPlayer o = s.getPlayerList().getPlayer(UUID.fromString(j.owner));     // 거리와 상관없이 계속 적용
+            if (o != null) o.addEffect(new MobEffectInstance(MobEffects.INVISIBILITY, 100, 0, true, false, false));
+        }
+    }
+
+    // ---------- 엔더 드래곤: 처치 경험치를 항상 12000으로 보정 ----------
+    static void startDragonTrack(ServerLevel l, Entity d) {
+        if (dTrackUntil >= 0 || server == null) return;
+        dTrackUntil = server.getTickCount() + 300;
+        dSum = 0; dLevel = l; dX = d.getX(); dY = d.getY(); dZ = d.getZ();
+    }
+    static void tickDragonXp(MinecraftServer s) {
+        ServerLevel end = s.getLevel(Level.END);
+        if (end != null && dTrackUntil < 0)
+            for (EnderDragon dr : end.getEntitiesOfClass(EnderDragon.class, new AABB(-400, -64, -400, 400, 400, 400)))
+                if (dr.getHealth() <= 0.0F) startDragonTrack(end, dr);
+        if (dTrackUntil >= 0 && s.getTickCount() >= dTrackUntil) {
+            int need = 12000 - dSum;
+            while (need > 0 && dLevel != null) {
+                int v = Math.min(need, 30000);
+                cmd(dLevel, "summon minecraft:experience_orb " + dX + " " + (dY + 1) + " " + dZ + " {Value:" + v + "s}");
+                need -= v;
+            }
+            dTrackUntil = -1;
         }
     }
 }
