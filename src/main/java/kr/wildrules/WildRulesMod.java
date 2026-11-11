@@ -15,6 +15,7 @@ import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
 import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.event.player.UseEntityCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
@@ -58,6 +59,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.entity.ExperienceOrb;
 import net.minecraft.world.entity.TamableAnimal;
 import net.minecraft.world.inventory.AnvilMenu;
+import net.minecraft.world.item.trading.Merchant;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
@@ -85,7 +87,7 @@ public class WildRulesMod implements ModInitializer {
     static final String STREAK_OBJECTIVE = "wr_streak"; // 데이터팩의 연속킬 점수판
 
     // ---- 저장 데이터 ----
-    static class Juke { String dim; int x, y, z; String owner; }
+    static class Juke { String dim; int x, y, z; String owner; String disc; }
     static class Rec {
         String dim; int x, y, z; String owner; String ownerName;
         String effect;
@@ -97,6 +99,8 @@ public class WildRulesMod implements ModInitializer {
         Map<String, Long> bans = new HashMap<>();
         boolean dragonKilled;
         List<Juke> jukes = new ArrayList<>();
+        List<String> deathDisc = new ArrayList<>();
+        List<String> deathPending = new ArrayList<>();
     }
     static class Pending { String dim; BlockPos pos; UUID uuid; String name; int age; }
 
@@ -126,9 +130,18 @@ public class WildRulesMod implements ModInitializer {
     static final List<Entity> dragonQueue = new ArrayList<>();
     // 접속하는 모든 플레이어에게 음반 리소스팩을 자동으로 보냄 (플레이어가 따로 설치할 필요 없음)
     static final String PACK_URL = "https://raw.githubusercontent.com/takgugang0504-glitch/wildrulesresospack/main/wild_rules_resourcepack.zip";
-    static final String PACK_SHA1 = "6fb0494ce35a815acb8305ada902c1004d65c089";
+    static final String PACK_SHA1 = "30e1b20ac2c0858ec164808fb5d8b1fb1235bea9";
     static final UUID PACK_ID = UUID.nameUUIDFromBytes("wildrules-resourcepack".getBytes());
-    static final String DISC_NAME = "Alia - 숨바꼭질 cover by 유즈하 리코";
+    static final Set<String> DISC_IDS = Set.of("minecraft:music_disc_precipice", "minecraft:music_disc_blocks", "minecraft:music_disc_ward",
+        "minecraft:music_disc_relic", "minecraft:music_disc_otherside");
+    static final String[] SEQ = {"minecraft:pig", "minecraft:cow", "minecraft:chicken", "minecraft:zombie", "minecraft:creeper", "minecraft:zombie",
+        "minecraft:skeleton", "minecraft:wither_skeleton", "minecraft:piglin", "minecraft:ghast", "minecraft:enderman", "minecraft:ender_dragon"};
+    static final Map<UUID, Integer> seqProgress = new HashMap<>();
+    static final Map<UUID, Long> wardCd = new HashMap<>();
+    static final Map<String, Object[]> durLast = new HashMap<>();
+    record PiglinBarter(Entity piglin, int due) { }
+    static final List<PiglinBarter> piglinBarters = new ArrayList<>();
+    static final double PIGLIN_CHANNELING = 0.05;      // 피글린 금괴 거래로 집전 책이 나올 확률
     static class TInfo { Entity e; UUID owner; int impaling, loyalty, channeling; boolean hit, bolt; }
     static final Map<UUID, TInfo> tridents = new HashMap<>();
     record Extra(LivingEntity victim, float amount, String attacker, float hp) { }
@@ -186,6 +199,19 @@ public class WildRulesMod implements ModInitializer {
         ServerLivingEntityEvents.AFTER_DEATH.register(WildRulesMod::afterDeath);
         PlayerBlockBreakEvents.BEFORE.register(WildRulesMod::beforeBreak);
         AttackEntityCallback.EVENT.register(WildRulesMod::onAttack);
+        UseEntityCallback.EVENT.register((pl, lvl, hand, entity, hit) -> {         // 피글린에게 금괴 거래 시작
+            if (!lvl.isClientSide() && server != null && typeId(entity).equals("minecraft:piglin") && pl.getItemInHand(hand).is(Items.GOLD_INGOT))
+                piglinBarters.add(new PiglinBarter(entity, server.getTickCount() + 125));
+            return InteractionResult.PASS;
+        });
+        PlayerBlockBreakEvents.AFTER.register((lvl, pl, pos, st, be) -> {           // 괭이로 양귀비 캘 때 5%: 로즈 음반
+            if (!(lvl instanceof ServerLevel sl) || !(pl instanceof ServerPlayer sp) || !st.is(Blocks.POPPY)) return;
+            if (!itemId(sp.getMainHandItem()).endsWith("_hoe")) return;
+            if (sl.getRandom().nextDouble() < 0.05) {
+                sl.addFreshEntity(new net.minecraft.world.entity.item.ItemEntity(sl, pos.getX() + 0.5, pos.getY() + 0.3, pos.getZ() + 0.5, new ItemStack(Items.MUSIC_DISC_WARD)));
+                cmd(server.overworld(), "advancement grant " + sp.getName().getString() + " only wr:lose");
+            }
+        });
         AttackBlockCallback.EVENT.register((pl, lvl, hand, pos, dir) -> {      // 신호기는 주인만 부술 수 있음 (채굴 시작 단계에서 차단)
             if (lvl.isClientSide() || !lvl.getBlockState(pos).is(Blocks.BEACON)) return InteractionResult.PASS;
             Rec r = find(dimKey(lvl), pos);
@@ -221,6 +247,8 @@ public class WildRulesMod implements ModInitializer {
                 if (d != null) data = d;
                 if (data.bans == null) data.bans = new HashMap<>();
                 if (data.jukes == null) data.jukes = new ArrayList<>();
+                if (data.deathDisc == null) data.deathDisc = new ArrayList<>();
+                if (data.deathPending == null) data.deathPending = new ArrayList<>();
             }
         } catch (Exception e) { System.err.println("[wildrules] load failed: " + e); }
     }
@@ -300,7 +328,7 @@ public class WildRulesMod implements ModInitializer {
 
         if (level.getBlockState(pos).is(Blocks.JUKEBOX) && isOurDisc(held)) {
             Pending jp = new Pending();
-            jp.dim = dimKey(level); jp.pos = pos.immutable(); jp.uuid = sp.getUUID(); jp.name = "";
+            jp.dim = dimKey(level); jp.pos = pos.immutable(); jp.uuid = sp.getUUID(); jp.name = itemId(held);
             jukePending.add(jp);
         }
         if (level.getBlockState(pos).is(Blocks.ENDER_CHEST)) {
@@ -482,9 +510,11 @@ public class WildRulesMod implements ModInitializer {
             }
             extras.clear();
         }
-        if (s.getTickCount() % 20 == 0) { safe(() -> tickJukes(s), "jukes"); safe(() -> tickDragonXp(s), "dragonxp"); }
+        if (s.getTickCount() % 20 == 0) { safe(() -> tickJukes(s), "jukes"); safe(() -> tickDragonXp(s), "dragonxp"); safe(() -> tickDeathDisc(s), "deathdisc"); safe(() -> tickPiglins(s), "piglins"); }
+        if (s.getTickCount() % 40 == 0) safe(() -> tickVillagers(s), "villagers");
         if (s.getTickCount() % 2 == 0) {
             safe(() -> tickBuffs(s), "buffs");
+            safe(() -> tickDurability(s), "durability");
             safe(() -> tickHeads(s), "heads");
             safe(() -> tickSmelt(s), "smelt");
             safe(() -> tickAnvil(s), "anvil");
@@ -587,6 +617,7 @@ public class WildRulesMod implements ModInitializer {
                 boolean bare = source.getEntity() instanceof ServerPlayer cp && source.getDirectEntity() == source.getEntity() && cp.getMainHandItem().isEmpty();
                 if (!bare) creeperTaint.add(victim.getUUID());
             }
+            if (victim instanceof ServerPlayer wv) wardCheck(wv);
             Entity de = source.getDirectEntity();
             Entity atk = source.getEntity();
             TInfo ti = de == null ? null : tridents.get(de.getUUID());
@@ -715,6 +746,31 @@ public class WildRulesMod implements ModInitializer {
 
     // ---------- 머리 드랍 확률 (플레이어가 처치했을 때) ----------
     static void afterDeath(LivingEntity e, DamageSource src) {
+        if (server != null && e instanceof ServerPlayer dpl && !data.deathDisc.contains(dpl.getUUID().toString())) {   // 처음 죽을 때 한 번만 음반 지급 예약
+            data.deathDisc.add(dpl.getUUID().toString());
+            data.deathPending.add(dpl.getUUID().toString());
+            save();
+        }
+        if (server != null && src.getEntity() instanceof ServerPlayer kpl && e != kpl) {
+            String vid = typeId(e);
+            if (vid.equals("minecraft:elder_guardian") && e.level() instanceof ServerLevel gl && gl.getRandom().nextDouble() < 0.25) {
+                gl.addFreshEntity(new net.minecraft.world.entity.item.ItemEntity(gl, e.getX(), e.getY() + 0.5, e.getZ(), new ItemStack(Items.MUSIC_DISC_RELIC)));
+                cmd(server.overworld(), "advancement grant " + kpl.getName().getString() + " only wr:aizo");
+            }
+            if (!(e instanceof ServerPlayer) && !vid.equals("minecraft:armor_stand")) {                 // 돼지>소>닭>좀비>크리퍼>좀비>스켈레톤>위더 스켈레톤>피글린>가스트>엔더맨>드래곤
+                int idx = seqProgress.getOrDefault(kpl.getUUID(), 0);
+                if (vid.equals(SEQ[idx])) {
+                    idx++;
+                    if (idx >= SEQ.length) {
+                        idx = 0;
+                        if (e.level() instanceof ServerLevel rl)
+                            rl.addFreshEntity(new net.minecraft.world.entity.item.ItemEntity(rl, e.getX(), e.getY() + 0.5, e.getZ(), new ItemStack(Items.MUSIC_DISC_OTHERSIDE)));
+                        cmd(server.overworld(), "advancement grant " + kpl.getName().getString() + " only wr:reflection");
+                    } else notice(kpl, "리플랙션 순서 " + idx + "/" + SEQ.length, ChatFormatting.AQUA);
+                } else idx = vid.equals(SEQ[0]) ? 1 : 0;
+                seqProgress.put(kpl.getUUID(), idx);
+            }
+        }
         if (server != null && typeId(e).equals("minecraft:ender_dragon") && e.level() instanceof ServerLevel dl) startDragonTrack(dl, e);
         if (server != null && typeId(e).equals("minecraft:creeper")) {            // 맨손으로만 잡은 크리퍼: 음반 + 도전과제
             boolean bare = src.getEntity() instanceof ServerPlayer kp && src.getDirectEntity() == src.getEntity()
@@ -722,7 +778,6 @@ public class WildRulesMod implements ModInitializer {
             creeperTaint.remove(e.getUUID());
             if (bare && e.level() instanceof ServerLevel cl) {
                 ItemStack disc = new ItemStack(Items.MUSIC_DISC_PRECIPICE);
-                disc.set(DataComponents.CUSTOM_NAME, Component.literal(DISC_NAME).withStyle(ChatFormatting.AQUA));
                 cl.addFreshEntity(new net.minecraft.world.entity.item.ItemEntity(cl, e.getX(), e.getY() + 0.5, e.getZ(), disc));
                 cmd(server.overworld(), "advancement grant " + ((ServerPlayer) src.getEntity()).getName().getString() + " only wr:creeper_veteran");
             }
@@ -1313,10 +1368,17 @@ public class WildRulesMod implements ModInitializer {
     }
 
     // ---------- 음반: 주크박스에 꽂혀 있는 동안 주인에게 투명화 ----------
-    static boolean isOurDisc(ItemStack st) {
-        if (!st.is(Items.MUSIC_DISC_PRECIPICE)) return false;
-        var n = st.get(DataComponents.CUSTOM_NAME);
-        return n != null && n.getString().contains("숨바꼭질");
+    static boolean isOurDisc(ItemStack st) { return DISC_IDS.contains(itemId(st)); }
+    static boolean ownsDisc(UUID id, String disc) {
+        for (Juke j : data.jukes) if (j.owner.equals(id.toString()) && disc.equals(j.disc)) return true;
+        return false;
+    }
+    static void wardCheck(ServerPlayer v) {       // 로즈 음반: 피해를 입으면 재생 I 10초 (쿨타임 10분)
+        long now = System.currentTimeMillis();
+        Long cd = wardCd.get(v.getUUID());
+        if ((cd != null && now < cd) || !ownsDisc(v.getUUID(), "minecraft:music_disc_ward")) return;
+        wardCd.put(v.getUUID(), now + 600000L);
+        v.addEffect(new MobEffectInstance(MobEffects.REGENERATION, 200, 0, false, true, true));
     }
     static void tickJukes(MinecraftServer s) {
         for (Iterator<Pending> it = jukePending.iterator(); it.hasNext(); ) {
@@ -1326,7 +1388,7 @@ public class WildRulesMod implements ModInitializer {
             if (l != null && l.getBlockState(jp.pos).is(Blocks.JUKEBOX)
                     && l.getBlockState(jp.pos).getValue(net.minecraft.world.level.block.JukeboxBlock.HAS_RECORD)) {
                 Juke j = new Juke();
-                j.dim = jp.dim; j.x = jp.pos.getX(); j.y = jp.pos.getY(); j.z = jp.pos.getZ(); j.owner = jp.uuid.toString();
+                j.dim = jp.dim; j.x = jp.pos.getX(); j.y = jp.pos.getY(); j.z = jp.pos.getZ(); j.owner = jp.uuid.toString(); j.disc = jp.name;
                 data.jukes.add(j);
                 save();
                 it.remove();
@@ -1340,7 +1402,8 @@ public class WildRulesMod implements ModInitializer {
                 if (!st.is(Blocks.JUKEBOX) || !st.getValue(net.minecraft.world.level.block.JukeboxBlock.HAS_RECORD)) { data.jukes.remove(j); save(); continue; }
             }
             ServerPlayer o = s.getPlayerList().getPlayer(UUID.fromString(j.owner));     // 거리와 상관없이 계속 적용
-            if (o != null) o.addEffect(new MobEffectInstance(MobEffects.INVISIBILITY, 100, 0, true, false, false));
+            if (o != null && "minecraft:music_disc_precipice".equals(j.disc)) o.addEffect(new MobEffectInstance(MobEffects.INVISIBILITY, 100, 0, true, false, false));
+            if (o != null && "minecraft:music_disc_otherside".equals(j.disc)) o.addEffect(new MobEffectInstance(MobEffects.SPEED, 100, 1, true, false, false));
         }
     }
 
@@ -1363,6 +1426,70 @@ public class WildRulesMod implements ModInitializer {
                 need -= v;
             }
             dTrackUntil = -1;
+        }
+    }
+
+    // ---------- 첫 죽음 음반 (한 사람당 딱 한 번) ----------
+    static void tickDeathDisc(MinecraftServer s) {
+        if (data.deathPending.isEmpty()) return;
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            String id = p.getUUID().toString();
+            if (!data.deathPending.contains(id) || !p.isAlive() || score(s, p, "wr_gift") < 1) continue;    // 데이터팩이 리스폰 정리를 끝낸 뒤에 지급
+            data.deathPending.remove(id);
+            save();
+            String n = p.getName().getString();
+            cmd(s.overworld(), "scoreboard players set " + n + " wr_gift 0");
+            cmd(s.overworld(), "give " + n + " minecraft:music_disc_blocks");
+            cmd(s.overworld(), "advancement grant " + n + " only wr:infinite_lives");
+        }
+    }
+
+    // ---------- 내구성 5: 겉날개/곡괭이/삽은 내구도가 닳지 않음 ----------
+    static void tickDurability(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            for (EquipmentSlot es : new EquipmentSlot[]{EquipmentSlot.MAINHAND, EquipmentSlot.OFFHAND, EquipmentSlot.CHEST}) {
+                ItemStack st = p.getItemBySlot(es);
+                String key = p.getUUID() + ":" + es.name();
+                String id = itemId(st);
+                if (st.isEmpty() || !st.isDamageableItem() || !(id.equals("minecraft:elytra") || id.endsWith("_pickaxe") || id.endsWith("_shovel"))
+                        || enchLevel(st, Enchantments.UNBREAKING) < 5) { durLast.remove(key); continue; }
+                Object[] last = durLast.get(key);
+                int cur = st.getDamageValue();
+                if (last != null && last[0] == st) {
+                    int d = (Integer) last[1];
+                    if (cur > d) { st.setDamageValue(d); cur = d; }
+                }
+                durLast.put(key, new Object[]{st, cur});
+            }
+        }
+    }
+
+    // ---------- 주민: 집전 책 판매 제거 / 피글린: 금괴 거래로 집전 책 ----------
+    static boolean hasChanneling(ItemStack st) {
+        var en = st.get(DataComponents.STORED_ENCHANTMENTS);
+        if (en == null) return false;
+        for (Holder<Enchantment> h : en.keySet()) if (h.is(Enchantments.CHANNELING)) return true;
+        return false;
+    }
+    static void tickVillagers(MinecraftServer s) {
+        for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+            for (Mob m : p.level().getEntitiesOfClass(Mob.class, p.getBoundingBox().inflate(48.0))) {
+                if (m instanceof Merchant mer) {
+                    try { mer.getOffers().removeIf(o -> hasChanneling(o.getResult())); } catch (Exception ignored) { }
+                }
+            }
+        }
+    }
+    static void tickPiglins(MinecraftServer s) {
+        for (Iterator<PiglinBarter> it = piglinBarters.iterator(); it.hasNext(); ) {
+            PiglinBarter b = it.next();
+            if (s.getTickCount() < b.due()) continue;
+            it.remove();
+            Entity pg = b.piglin();
+            if (pg.isRemoved() || !pg.isAlive() || !(pg.level() instanceof ServerLevel l)) continue;
+            if (l.getRandom().nextDouble() < PIGLIN_CHANNELING)
+                cmd(l, "summon minecraft:item " + pg.getX() + " " + (pg.getY() + 1.0) + " " + pg.getZ()
+                    + " {Item:{id:\"minecraft:enchanted_book\",count:1,components:{\"minecraft:stored_enchantments\":{\"minecraft:channeling\":1}}}}");
         }
     }
 }
